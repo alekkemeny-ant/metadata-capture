@@ -153,7 +153,7 @@ def _check_required_fields(metadata: dict, result: ValidationResult) -> None:
 def _validate_subject(metadata: dict, result: ValidationResult) -> None:
     """Validate subject fields."""
     subject = metadata.get("subject")
-    if not subject:
+    if not subject or not isinstance(subject, dict):
         return
 
     # subject_id: should be numeric, 4+ digits
@@ -194,7 +194,7 @@ def _validate_subject(metadata: dict, result: ValidationResult) -> None:
 def _validate_data_description(metadata: dict, result: ValidationResult) -> None:
     """Validate data_description fields."""
     dd = metadata.get("data_description")
-    if not dd:
+    if not dd or not isinstance(dd, dict):
         return
 
     # modality
@@ -228,7 +228,9 @@ def _validate_session(metadata: dict, result: ValidationResult) -> None:
     session = metadata.get("session")
     if not session:
         # If modality is physiology-based, session times are expected
-        dd = metadata.get("data_description", {})
+        dd = metadata.get("data_description") or {}
+        if not isinstance(dd, dict):
+            return
         modality = dd.get("modality", [])
         if isinstance(modality, list):
             for mod in modality:
@@ -237,6 +239,9 @@ def _validate_session(metadata: dict, result: ValidationResult) -> None:
                         "session",
                         f"Session information expected for physiology modality '{mod.get('abbreviation')}'",
                     )
+        return
+
+    if not isinstance(session, dict):
         return
 
     start = session.get("session_start_time")
@@ -289,7 +294,7 @@ def _validate_session(metadata: dict, result: ValidationResult) -> None:
 def _validate_procedures(metadata: dict, result: ValidationResult) -> None:
     """Validate procedures fields."""
     procedures = metadata.get("procedures")
-    if not procedures:
+    if not procedures or not isinstance(procedures, dict):
         return
 
     # protocol_id

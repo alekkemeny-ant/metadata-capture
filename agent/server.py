@@ -5,6 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -12,6 +13,9 @@ from pydantic import BaseModel
 
 from .db.database import close_db, init_db
 from .service import chat, confirm_draft, get_all_drafts, get_session_messages, get_sessions
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 @asynccontextmanager
