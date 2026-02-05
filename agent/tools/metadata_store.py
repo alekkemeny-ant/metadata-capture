@@ -1,4 +1,4 @@
-"""Tools for persisting and retrieving draft metadata in SQLite."""
+"""Tools for persisting and retrieving metadata records in SQLite."""
 
 import json
 import logging
@@ -7,238 +7,326 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..db.database import get_db
+from ..db.models import CATEGORY_MAP, VALID_RECORD_TYPES
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Metadata field names that map to JSON columns
+# Helpers
 # ---------------------------------------------------------------------------
-METADATA_FIELDS = (
-    "subject_json",
-    "procedures_json",
-    "data_description_json",
-    "instrument_json",
-    "acquisition_json",
-    "session_json",
-    "processing_json",
-    "quality_control_json",
-    "rig_json",
-)
+
+def _parse_json(value: str | None) -> Any:
+    """Parse a JSON string, returning None on failure."""
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
 
 
 def _row_to_dict(row) -> dict[str, Any]:
     """Convert an aiosqlite Row to a plain dict, parsing JSON columns."""
     d = dict(row)
-    for field in METADATA_FIELDS:
-        if d.get(field):
-            try:
-                d[field] = json.loads(d[field])
-            except (json.JSONDecodeError, TypeError):
-                pass
-    if d.get("validation_results_json"):
-        try:
-            d["validation_results_json"] = json.loads(d["validation_results_json"])
-        except (json.JSONDecodeError, TypeError):
-            pass
+    if d.get("data_json"):
+        d["data_json"] = _parse_json(d["data_json"])
+    if d.get("validation_json"):
+        d["validation_json"] = _parse_json(d["validation_json"])
     return d
 
 
-async def save_draft_metadata(session_id: str, metadata_json: dict[str, Any]) -> dict[str, Any]:
-    """Save a new draft metadata entry for the given session.
-
-    Parameters
-    ----------
-    session_id : str
-        The session identifier.
-    metadata_json : dict
-        A dict whose keys are top-level metadata fields (e.g. "subject",
-        "procedures", "data_description") and values are the JSON-serialisable
-        data for that field.
-
-    Returns
-    -------
-    dict
-        The saved draft row as a dict including its generated id.
-    """
-    db = await get_db()
-    draft_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-
-    columns = ["id", "session_id", "status", "created_at", "updated_at"]
-    values: list[Any] = [draft_id, session_id, "draft", now, now]
-
-    for field in METADATA_FIELDS:
-        key = field.replace("_json", "")
-        if key in metadata_json:
-            raw = metadata_json[key]
-            # Guard against double-serialization: if the value is already a
-            # JSON string, store it directly instead of wrapping it again.
-            if isinstance(raw, str):
-                try:
-                    json.loads(raw)  # validate it's proper JSON
-                    serialized = raw
-                except (json.JSONDecodeError, ValueError):
-                    serialized = json.dumps(raw)
-            else:
-                serialized = json.dumps(raw)
-            columns.append(field)
-            values.append(serialized)
-
-    placeholders = ", ".join("?" for _ in values)
-    col_names = ", ".join(columns)
-
-    await db.execute(
-        f"INSERT INTO draft_metadata ({col_names}) VALUES ({placeholders})",
-        values,
-    )
-    await db.commit()
-
-    return await get_draft_metadata(session_id)
-
-
-async def get_draft_metadata(session_id: str) -> dict[str, Any] | None:
-    """Retrieve the most recent draft metadata for a session.
-
-    Parameters
-    ----------
-    session_id : str
-        The session identifier.
-
-    Returns
-    -------
-    dict or None
-        The draft metadata row or None if not found.
-    """
-    db = await get_db()
-    cursor = await db.execute(
-        "SELECT * FROM draft_metadata WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
-        (session_id,),
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        return None
-    return _row_to_dict(row)
-
-
-async def update_draft_metadata(session_id: str, field: str, value: Any) -> dict[str, Any] | None:
-    """Update a specific metadata field for the latest draft in a session.
-
-    Parameters
-    ----------
-    session_id : str
-        The session identifier.
-    field : str
-        The metadata field name (e.g. "subject", "procedures"). The "_json"
-        suffix is added automatically if missing.
-    value : Any
-        The new value (will be JSON-serialised).
-
-    Returns
-    -------
-    dict or None
-        The updated row, or None if no draft exists for this session.
-    """
-    col = field if field.endswith("_json") else f"{field}_json"
-    if col not in METADATA_FIELDS and col != "validation_results_json":
-        return {"error": f"Unknown metadata field: {field}"}
-
-    db = await get_db()
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Find the latest draft for this session
-    cursor = await db.execute(
-        "SELECT id FROM draft_metadata WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
-        (session_id,),
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        return None
-
-    # Guard against double-serialization
+def _serialize(value: Any) -> str:
+    """Serialize a value to JSON, guarding against double-serialization."""
     if isinstance(value, str):
         try:
             json.loads(value)
-            serialized = value
+            return value  # already valid JSON
         except (json.JSONDecodeError, ValueError):
-            serialized = json.dumps(value)
-    else:
-        serialized = json.dumps(value)
+            return json.dumps(value)
+    return json.dumps(value)
+
+
+def _auto_name(record_type: str, data: dict[str, Any]) -> str | None:
+    """Auto-generate a display name from record data."""
+    if record_type == "subject":
+        sid = data.get("subject_id")
+        species = data.get("species", {})
+        species_name = species.get("name", "") if isinstance(species, dict) else ""
+        if sid:
+            return f"{species_name} {sid}".strip() if species_name else str(sid)
+    elif record_type == "instrument":
+        return data.get("instrument_id") or data.get("name")
+    elif record_type == "rig":
+        return data.get("rig_id") or data.get("name")
+    elif record_type == "procedures":
+        ptype = data.get("procedure_type")
+        return str(ptype) if ptype else None
+    elif record_type == "data_description":
+        pname = data.get("project_name")
+        return str(pname) if pname else None
+    elif record_type == "session":
+        start = data.get("session_start_time")
+        return f"Session {start}" if start else None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Record CRUD
+# ---------------------------------------------------------------------------
+
+async def create_record(
+    session_id: str,
+    record_type: str,
+    data: dict[str, Any],
+    name: str | None = None,
+) -> dict[str, Any]:
+    """Create a new metadata record.
+
+    Returns the created record as a dict.
+    """
+    if record_type not in VALID_RECORD_TYPES:
+        raise ValueError(f"Invalid record_type: {record_type}")
+
+    db = await get_db()
+    record_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    category = CATEGORY_MAP[record_type]
+    display_name = name or _auto_name(record_type, data)
 
     await db.execute(
-        f"UPDATE draft_metadata SET {col} = ?, updated_at = ? WHERE id = ?",
-        (serialized, now, row["id"]),
+        """INSERT INTO metadata_records
+           (id, session_id, record_type, category, name, data_json, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+        (record_id, session_id, record_type, category, display_name, _serialize(data), now, now),
     )
     await db.commit()
-    return await get_draft_metadata(session_id)
+    record = await get_record(record_id)
+    assert record is not None, f"Record {record_id} not found after insert"
+    return record
 
 
-async def list_all_drafts(status_filter: str | None = None) -> list[dict[str, Any]]:
-    """List all draft metadata entries, optionally filtered by status.
-
-    Parameters
-    ----------
-    status_filter : str, optional
-        Filter by status: "draft", "validated", "confirmed", "error".
-
-    Returns
-    -------
-    list[dict]
-        List of draft metadata rows.
-    """
+async def get_record(record_id: str) -> dict[str, Any] | None:
+    """Get a single record by ID."""
     db = await get_db()
-    if status_filter:
-        cursor = await db.execute(
-            "SELECT * FROM draft_metadata WHERE status = ? ORDER BY created_at DESC",
-            (status_filter,),
+    cursor = await db.execute("SELECT * FROM metadata_records WHERE id = ?", (record_id,))
+    row = await cursor.fetchone()
+    return _row_to_dict(row) if row else None
+
+
+async def update_record(
+    record_id: str,
+    data: dict[str, Any] | None = None,
+    name: str | None = None,
+) -> dict[str, Any] | None:
+    """Update a record's data and/or name. Merges data with existing."""
+    db = await get_db()
+    now = datetime.now(timezone.utc).isoformat()
+
+    existing = await get_record(record_id)
+    if existing is None:
+        return None
+
+    merged_data = existing.get("data_json") or {}
+
+    if data is not None:
+        if isinstance(merged_data, dict) and isinstance(data, dict):
+            merged_data = {**merged_data, **data}
+        else:
+            merged_data = data
+        await db.execute(
+            "UPDATE metadata_records SET data_json = ?, updated_at = ? WHERE id = ?",
+            (_serialize(merged_data), now, record_id),
         )
-    else:
-        cursor = await db.execute(
-            "SELECT * FROM draft_metadata ORDER BY created_at DESC"
+
+    if name is not None:
+        await db.execute(
+            "UPDATE metadata_records SET name = ?, updated_at = ? WHERE id = ?",
+            (name, now, record_id),
         )
+    elif data is not None:
+        # Auto-update name from merged data
+        auto = _auto_name(existing["record_type"], merged_data)
+        if auto:
+            await db.execute(
+                "UPDATE metadata_records SET name = ?, updated_at = ? WHERE id = ?",
+                (auto, now, record_id),
+            )
+
+    await db.commit()
+    return await get_record(record_id)
+
+
+async def update_record_field(record_id: str, field: str, value: Any) -> dict[str, Any] | None:
+    """Update a single field within a record's data_json."""
+    existing = await get_record(record_id)
+    if existing is None:
+        return None
+    data = existing.get("data_json") or {}
+    if not isinstance(data, dict):
+        data = {}
+    data[field] = value
+    return await update_record(record_id, data=data)
+
+
+async def update_record_validation(record_id: str, validation: dict[str, Any]) -> None:
+    """Update a record's validation results."""
+    db = await get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "UPDATE metadata_records SET validation_json = ?, updated_at = ? WHERE id = ?",
+        (_serialize(validation), now, record_id),
+    )
+    await db.commit()
+
+
+async def confirm_record(record_id: str) -> dict[str, Any] | None:
+    """Mark a record as confirmed."""
+    db = await get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = await db.execute("SELECT id FROM metadata_records WHERE id = ?", (record_id,))
+    if await cursor.fetchone() is None:
+        return None
+    await db.execute(
+        "UPDATE metadata_records SET status = 'confirmed', updated_at = ? WHERE id = ?",
+        (now, record_id),
+    )
+    await db.commit()
+    return await get_record(record_id)
+
+
+async def delete_record(record_id: str) -> bool:
+    """Delete a record and its links."""
+    db = await get_db()
+    cursor = await db.execute("DELETE FROM metadata_records WHERE id = ?", (record_id,))
+    await db.commit()
+    return (cursor.rowcount or 0) > 0
+
+
+# ---------------------------------------------------------------------------
+# Record queries
+# ---------------------------------------------------------------------------
+
+async def list_records(
+    record_type: str | None = None,
+    category: str | None = None,
+    session_id: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """List records with optional filters."""
+    db = await get_db()
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if record_type:
+        clauses.append("record_type = ?")
+        params.append(record_type)
+    if category:
+        clauses.append("category = ?")
+        params.append(category)
+    if session_id:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    cursor = await db.execute(
+        f"SELECT * FROM metadata_records{where} ORDER BY created_at DESC",
+        params,
+    )
     rows = await cursor.fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
-async def confirm_metadata(session_id: str) -> dict[str, Any] | None:
-    """Mark the latest draft for a session as confirmed.
+async def find_records(
+    record_type: str | None = None,
+    query: str | None = None,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
+    """Search records by type, category, and/or text query against name and data."""
+    db = await get_db()
+    clauses: list[str] = []
+    params: list[Any] = []
 
-    Parameters
-    ----------
-    session_id : str
-        The session identifier.
+    if record_type:
+        clauses.append("record_type = ?")
+        params.append(record_type)
+    if category:
+        clauses.append("category = ?")
+        params.append(category)
+    if query:
+        clauses.append("(name LIKE ? OR data_json LIKE ?)")
+        params.extend([f"%{query}%", f"%{query}%"])
 
-    Returns
-    -------
-    dict or None
-        The updated row, or None if no draft exists.
-    """
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    cursor = await db.execute(
+        f"SELECT * FROM metadata_records{where} ORDER BY updated_at DESC LIMIT 50",
+        params,
+    )
+    rows = await cursor.fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+async def get_session_records(session_id: str) -> list[dict[str, Any]]:
+    """Get all records created in a session."""
+    return await list_records(session_id=session_id)
+
+
+# ---------------------------------------------------------------------------
+# Record linking
+# ---------------------------------------------------------------------------
+
+async def link_records(source_id: str, target_id: str) -> dict[str, Any]:
+    """Create a link between two records. Returns link info."""
     db = await get_db()
     now = datetime.now(timezone.utc).isoformat()
+    try:
+        await db.execute(
+            "INSERT INTO record_links (source_id, target_id, created_at) VALUES (?, ?, ?)",
+            (source_id, target_id, now),
+        )
+        await db.commit()
+    except Exception:
+        # UNIQUE constraint — link already exists
+        pass
+    return {"source_id": source_id, "target_id": target_id}
 
+
+async def get_linked_records(record_id: str) -> list[dict[str, Any]]:
+    """Get all records linked to a given record (in either direction)."""
+    db = await get_db()
     cursor = await db.execute(
-        "SELECT id FROM draft_metadata WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
-        (session_id,),
+        """SELECT m.* FROM metadata_records m
+           INNER JOIN record_links l ON (m.id = l.target_id AND l.source_id = ?)
+                                     OR (m.id = l.source_id AND l.target_id = ?)""",
+        (record_id, record_id),
     )
-    row = await cursor.fetchone()
-    if row is None:
-        return None
+    rows = await cursor.fetchall()
+    return [_row_to_dict(r) for r in rows]
 
-    await db.execute(
-        "UPDATE draft_metadata SET status = 'confirmed', updated_at = ? WHERE id = ?",
-        (now, row["id"]),
+
+async def unlink_records(source_id: str, target_id: str) -> bool:
+    """Remove a link between two records."""
+    db = await get_db()
+    cursor = await db.execute(
+        "DELETE FROM record_links WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)",
+        (source_id, target_id, target_id, source_id),
     )
     await db.commit()
-    return await get_draft_metadata(session_id)
+    return (cursor.rowcount or 0) > 0
 
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
 
 async def delete_session(session_id: str) -> bool:
-    """Delete all data for a session (conversations and draft metadata).
-
-    Returns True if anything was deleted, False otherwise.
-    """
+    """Delete all data for a session (conversations and records)."""
     db = await get_db()
     c1 = await db.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
-    c2 = await db.execute("DELETE FROM draft_metadata WHERE session_id = ?", (session_id,))
+    c2 = await db.execute("DELETE FROM metadata_records WHERE session_id = ?", (session_id,))
     await db.commit()
     return (c1.rowcount or 0) + (c2.rowcount or 0) > 0
 

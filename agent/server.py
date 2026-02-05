@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .db.database import close_db, init_db
-from .service import chat, confirm_draft, get_all_drafts, get_session_messages, get_sessions
+from .service import AVAILABLE_MODELS, DEFAULT_MODEL, chat, get_session_messages, get_sessions
 
 # Load environment variables from .env file
 load_dotenv()
@@ -45,27 +45,30 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
+    model: str | None = None
+
+
+class LinkRequest(BaseModel):
+    source_id: str
+    target_id: str
+
+
+class UpdateRecordDataRequest(BaseModel):
+    data: dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Chat endpoint
 # ---------------------------------------------------------------------------
 
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
-    """Stream a chat response using Server-Sent Events.
-
-    Accepts {"message": str, "session_id": str | null}.
-    Returns an SSE stream with:
-      data: {"session_id": "..."}
-      data: {"content": "..."}   (repeated)
-      data: [DONE]
-    """
+    """Stream a chat response using Server-Sent Events."""
     session_id = req.session_id or str(uuid.uuid4())
 
     async def event_stream():
-        async for chunk in chat(session_id, req.message):
+        async for chunk in chat(session_id, req.message, model=req.model):
             yield f"data: {json.dumps(chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -79,19 +82,117 @@ async def chat_endpoint(req: ChatRequest):
     )
 
 
-@app.get("/metadata")
-async def list_metadata(status: str | None = None) -> list[dict[str, Any]]:
-    """List all draft metadata entries, optionally filtered by status."""
-    return await get_all_drafts(status)
+# ---------------------------------------------------------------------------
+# Records endpoints
+# ---------------------------------------------------------------------------
 
 
-@app.post("/metadata/{session_id}/confirm")
-async def confirm_metadata_endpoint(session_id: str):
-    """Confirm (finalize) the draft metadata for a session."""
-    result = await confirm_draft(session_id)
+@app.get("/records")
+async def list_records_endpoint(
+    type: str | None = None,
+    category: str | None = None,
+    session_id: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """List metadata records with optional filters."""
+    from .tools.metadata_store import list_records
+
+    return await list_records(
+        record_type=type,
+        category=category,
+        session_id=session_id,
+        status=status,
+    )
+
+
+@app.get("/records/{record_id}")
+async def get_record_endpoint(record_id: str) -> dict[str, Any]:
+    """Get a single record with its linked records."""
+    from .tools.metadata_store import get_linked_records, get_record
+
+    record = await get_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    links = await get_linked_records(record_id)
+    record["links"] = links
+    return record
+
+
+@app.put("/records/{record_id}")
+async def update_record_endpoint(record_id: str, req: UpdateRecordDataRequest) -> dict[str, Any]:
+    """Update a record's data."""
+    from .tools.metadata_store import get_record, update_record
+    from .validation import validate_record
+
+    existing = await get_record(record_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    result = await update_record(record_id, data=req.data)
     if result is None:
-        raise HTTPException(status_code=404, detail="No draft found for this session")
+        raise HTTPException(status_code=500, detail="Failed to update record")
+
+    # Re-validate
+    from .tools.metadata_store import update_record_validation
+    validation = validate_record(existing["record_type"], result.get("data_json") or {})
+    await update_record_validation(record_id, validation.to_dict())
+
+    updated = await get_record(record_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Record not found after update")
+    return updated
+
+
+@app.post("/records/{record_id}/confirm")
+async def confirm_record_endpoint(record_id: str):
+    """Confirm a record."""
+    from .tools.metadata_store import confirm_record
+
+    result = await confirm_record(record_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Record not found")
     return result
+
+
+@app.get("/records/{record_id}/links")
+async def get_record_links_endpoint(record_id: str) -> list[dict[str, Any]]:
+    """Get all records linked to a given record."""
+    from .tools.metadata_store import get_linked_records, get_record
+
+    record = await get_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return await get_linked_records(record_id)
+
+
+@app.post("/records/link")
+async def link_records_endpoint(req: LinkRequest) -> dict[str, Any]:
+    """Link two records together."""
+    from .tools.metadata_store import get_record, link_records
+
+    source = await get_record(req.source_id)
+    target = await get_record(req.target_id)
+    if source is None or target is None:
+        raise HTTPException(status_code=404, detail="One or both records not found")
+
+    return await link_records(req.source_id, req.target_id)
+
+
+@app.delete("/records/{record_id}")
+async def delete_record_endpoint(record_id: str):
+    """Delete a record."""
+    from .tools.metadata_store import delete_record
+
+    deleted = await delete_record(record_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return {"status": "deleted", "record_id": record_id}
+
+
+# ---------------------------------------------------------------------------
+# Session endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.get("/sessions")
@@ -106,9 +207,17 @@ async def get_messages(session_id: str) -> list[dict[str, Any]]:
     return await get_session_messages(session_id)
 
 
+@app.get("/sessions/{session_id}/records")
+async def get_session_records_endpoint(session_id: str) -> list[dict[str, Any]]:
+    """Get all records created in a session."""
+    from .tools.metadata_store import get_session_records
+
+    return await get_session_records(session_id)
+
+
 @app.delete("/sessions/{session_id}")
 async def delete_session_endpoint(session_id: str):
-    """Delete a session and all its data (conversations + draft metadata)."""
+    """Delete a session and all its data."""
     from .tools.metadata_store import delete_session
 
     deleted = await delete_session(session_id)
@@ -117,30 +226,15 @@ async def delete_session_endpoint(session_id: str):
     return {"status": "deleted", "session_id": session_id}
 
 
-class UpdateFieldRequest(BaseModel):
-    field: str
-    value: dict[str, Any]
+# ---------------------------------------------------------------------------
+# Models + Health
+# ---------------------------------------------------------------------------
 
 
-@app.put("/metadata/{session_id}/fields")
-async def update_field(session_id: str, req: UpdateFieldRequest):
-    """Update a single metadata field for a session's draft."""
-    from .tools.metadata_store import update_draft_metadata
-
-    result = await update_draft_metadata(session_id, req.field, req.value)
-    if result is None:
-        raise HTTPException(status_code=404, detail="No draft found for this session")
-    return result
-
-
-@app.get("/metadata/{session_id}/validation")
-async def get_validation(session_id: str):
-    """Get validation results for a session's draft metadata."""
-    from .service import get_draft_metadata
-    draft = await get_draft_metadata(session_id)
-    if draft is None:
-        raise HTTPException(status_code=404, detail="No draft found for this session")
-    return draft.get("validation_results_json") or {"status": "pending", "errors": [], "warnings": [], "missing_required": [], "valid_fields": [], "completeness_score": 0}
+@app.get("/models")
+async def list_models():
+    """List available models and the current default."""
+    return {"models": AVAILABLE_MODELS, "default": DEFAULT_MODEL}
 
 
 @app.get("/health")

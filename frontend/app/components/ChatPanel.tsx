@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { sendChatMessage, fetchMessages, ChatMessage } from '../lib/api';
+import { sendChatMessage, fetchMessages, fetchModels, ChatMessage } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // Block types for structured assistant messages
@@ -49,24 +49,83 @@ function ThinkingBlock({ content }: { content: string }) {
   );
 }
 
+// Friendly status labels for tool names
+const TOOL_STATUS_LABELS: Record<string, { active: string; done: string }> = {
+  WebSearch: { active: 'Searching the web...', done: 'Web search complete' },
+  WebFetch: { active: 'Fetching page...', done: 'Page fetched' },
+  Bash: { active: 'Running command...', done: 'Command finished' },
+  Read: { active: 'Reading file...', done: 'File read' },
+  Write: { active: 'Writing file...', done: 'File written' },
+  Grep: { active: 'Searching files...', done: 'Search complete' },
+  Glob: { active: 'Finding files...', done: 'Files found' },
+  capture_metadata: { active: 'Extracting metadata...', done: 'Metadata captured' },
+  validate_metadata: { active: 'Validating metadata...', done: 'Validation complete' },
+  registry_lookup: { active: 'Checking external registry...', done: 'Registry lookup complete' },
+};
+
+function getToolLabel(name: string, active: boolean): string {
+  const labels = TOOL_STATUS_LABELS[name];
+  if (labels) return active ? labels.active : labels.done;
+  // Fallback: humanize the tool name
+  const humanized = name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ');
+  return active ? `Running ${humanized}...` : `${humanized} done`;
+}
+
+function ElapsedTimer() {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const t0 = Date.now();
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - t0) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (elapsed < 2) return null; // don't show for quick operations
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  return (
+    <span className="text-xs text-sand-400 tabular-nums ml-auto">
+      {mins > 0 ? `${mins}m ${secs}s` : `${secs}s`}
+    </span>
+  );
+}
+
 function ToolUseBlock({ name, content, isStreaming }: { name: string; content: string; isStreaming?: boolean }) {
-  const [expanded, setExpanded] = useState(false);
+  const [manualExpand, setManualExpand] = useState<boolean | null>(null);
+  // Auto-expand while streaming, auto-collapse when done; manual toggle overrides
+  const expanded = manualExpand !== null ? manualExpand : !!isStreaming;
   let prettyInput = content;
   try { prettyInput = JSON.stringify(JSON.parse(content), null, 2); } catch { /* show raw */ }
   return (
-    <div className="my-1.5 border border-sand-200 rounded-lg overflow-hidden">
+    <div className={`my-1.5 rounded-lg overflow-hidden border transition-colors ${
+      isStreaming ? 'border-brand-fig/30 bg-brand-magenta-100/40' : 'border-sand-200'
+    }`}>
       <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 bg-sand-50 hover:bg-sand-100 transition-colors text-left"
+        onClick={() => setManualExpand(expanded ? false : true)}
+        className="w-full flex items-center gap-2 px-3 py-2 bg-sand-50 hover:bg-sand-100 transition-colors text-left"
       >
-        <svg className="w-3.5 h-3.5 text-brand-fig" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z" /></svg>
-        <span className="text-xs font-medium text-sand-600">{name}</span>
-        {isStreaming && <span className="text-xs text-sand-400 ml-1 animate-pulse">●</span>}
-        <svg className={`w-3.5 h-3.5 text-sand-400 ml-auto transition-transform ${expanded ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
+        {isStreaming ? (
+          <span className="relative flex h-3.5 w-3.5 items-center justify-center">
+            <span className="absolute inline-flex h-full w-full rounded-full bg-brand-fig/30 animate-ping" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-brand-fig" />
+          </span>
+        ) : (
+          <svg className="w-3.5 h-3.5 text-brand-aqua-500" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" /></svg>
+        )}
+        <span className={`text-xs font-medium ${isStreaming ? 'text-sand-700' : 'text-sand-500'}`}>
+          {getToolLabel(name, !!isStreaming)}
+        </span>
+        {isStreaming && <ElapsedTimer />}
+        {!isStreaming && (
+          <svg className={`w-3.5 h-3.5 text-sand-400 ml-auto transition-transform ${expanded ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
+        )}
       </button>
-      {expanded && (
+      {isStreaming && (
+        <div className="h-0.5 bg-sand-100 overflow-hidden">
+          <div className="h-full w-1/3 bg-brand-fig/40 rounded-full animate-shimmer" />
+        </div>
+      )}
+      {expanded && prettyInput && (
         <div className="px-3 py-2 text-xs font-mono text-sand-600 border-t border-sand-100 max-h-64 overflow-y-auto whitespace-pre-wrap bg-sand-50">
-          {prettyInput || '…'}
+          {prettyInput}
         </div>
       )}
     </div>
@@ -94,9 +153,9 @@ function restoreMessages(sessionId: string, backendMessages: StructuredMessage[]
     // Backend is authoritative for message content; localStorage provides
     // blocks and any trailing partial messages the backend never received
     // (e.g. an assistant response interrupted by abort).
-    const merged = backendMessages.map((msg, i) => ({
+    const merged: StructuredMessage[] = backendMessages.map((msg, i) => ({
       ...msg,
-      blocks: local[i]?.blocks ?? undefined,
+      blocks: local[i]?.blocks,
     }));
 
     // Append messages that exist locally but not in the backend
@@ -122,6 +181,8 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -133,6 +194,14 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
   useEffect(() => {
     scrollToBottom();
   }, [messages, scrollToBottom]);
+
+  // Fetch available models on mount
+  useEffect(() => {
+    fetchModels().then((info) => {
+      setAvailableModels(info.models);
+      setSelectedModel(info.default);
+    });
+  }, []);
 
   // Load messages when sessionId changes, restoring blocks & partial messages
   useEffect(() => {
@@ -238,6 +307,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
         });
       },
       controller.signal,
+      selectedModel || undefined,
     );
   };
 
@@ -350,6 +420,28 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
                        placeholder:text-sand-400"
             disabled={isStreaming}
           />
+          {/* Model selector */}
+          {availableModels.length > 0 && (
+            <div className="absolute left-3 bottom-3">
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                disabled={isStreaming}
+                className="appearance-none text-xs text-sand-500 bg-transparent
+                           hover:text-sand-700 focus:text-sand-700 focus:outline-none
+                           cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed
+                           pr-4 py-1"
+                title="Select model"
+              >
+                {availableModels.map((m) => (
+                  <option key={m} value={m}>
+                    {m.replace('claude-', '').replace(/-\d{8}$/, '')}
+                  </option>
+                ))}
+              </select>
+              <svg className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 text-sand-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
+            </div>
+          )}
           <div className="absolute right-3 bottom-3">
             {isStreaming ? (
               <button

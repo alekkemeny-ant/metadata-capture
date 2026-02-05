@@ -3,63 +3,25 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001';
 export interface ValidationResults {
   status: 'valid' | 'warnings' | 'errors' | 'pending';
   completeness_score: number;
+  record_type?: string;
   errors: { field: string; message: string; severity: string }[];
   warnings: { field: string; message: string; severity: string }[];
   missing_required: string[];
   valid_fields: string[];
 }
 
-export interface MetadataEntry {
+export interface MetadataRecord {
   id: string;
-  subject_id: string;
   session_id: string;
-  status: 'draft' | 'confirmed';
-  fields: Record<string, unknown>;
-  validation: ValidationResults | null;
+  record_type: string;
+  category: 'shared' | 'asset';
+  name: string | null;
+  data_json: Record<string, unknown>;
+  status: 'draft' | 'validated' | 'confirmed' | 'error';
+  validation_json: ValidationResults | null;
+  links?: MetadataRecord[];
   created_at: string;
   updated_at: string;
-}
-
-const SCHEMA_FIELDS = [
-  'subject_json', 'procedures_json', 'data_description_json',
-  'instrument_json', 'acquisition_json', 'session_json',
-  'processing_json', 'quality_control_json', 'rig_json',
-] as const;
-
-/** Transform a raw backend metadata row into the frontend MetadataEntry shape. */
-function toMetadataEntry(raw: Record<string, unknown>): MetadataEntry {
-  const fields: Record<string, unknown> = {};
-  for (const key of SCHEMA_FIELDS) {
-    const val = raw[key];
-    if (val != null && typeof val === 'object' && Object.keys(val as object).length > 0) {
-      const label = key.replace('_json', '');
-      fields[label] = val;
-    }
-  }
-
-  // Try to extract a display label from the subject section.
-  // Prefer subject_id, but fall back to the first scalar value if the key was renamed.
-  const subjectData = raw.subject_json as Record<string, unknown> | null;
-  let subjectLabel: string | undefined = subjectData?.subject_id as string | undefined;
-  if (!subjectLabel && subjectData) {
-    for (const v of Object.values(subjectData)) {
-      if (typeof v === 'string' && v.trim()) { subjectLabel = v; break; }
-      if (typeof v === 'number') { subjectLabel = String(v); break; }
-    }
-  }
-
-  const validation = raw.validation_results_json as ValidationResults | null;
-
-  return {
-    id: raw.id as string,
-    subject_id: subjectLabel || raw.session_id as string || 'Untitled',
-    session_id: raw.session_id as string,
-    status: raw.status as 'draft' | 'confirmed',
-    fields,
-    validation: validation || null,
-    created_at: raw.created_at as string,
-    updated_at: raw.updated_at as string,
-  };
 }
 
 export interface Session {
@@ -75,6 +37,21 @@ export interface ChatMessage {
   content: string;
 }
 
+export interface ModelInfo {
+  models: string[];
+  default: string;
+}
+
+export async function fetchModels(): Promise<ModelInfo> {
+  try {
+    const res = await fetch(`${API_BASE}/models`);
+    if (!res.ok) throw new Error('Failed to fetch models');
+    return res.json();
+  } catch {
+    return { models: ['claude-opus-4-6', 'claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001'], default: 'claude-opus-4-6' };
+  }
+}
+
 export async function sendChatMessage(
   message: string,
   sessionId: string | null,
@@ -82,6 +59,7 @@ export async function sendChatMessage(
   onDone: () => void,
   onError: (err: Error) => void,
   signal?: AbortSignal,
+  model?: string,
 ) {
   try {
     const res = await fetch(`${API_BASE}/chat`, {
@@ -90,6 +68,7 @@ export async function sendChatMessage(
       body: JSON.stringify({
         message,
         ...(sessionId ? { session_id: sessionId } : {}),
+        ...(model ? { model } : {}),
       }),
       signal,
     });
@@ -153,27 +132,68 @@ export async function fetchMessages(sessionId: string): Promise<ChatMessage[]> {
   return data.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 }
 
-export async function fetchMetadata(): Promise<MetadataEntry[]> {
-  const res = await fetch(`${API_BASE}/metadata`);
-  if (!res.ok) throw new Error(`Failed to fetch metadata: ${res.status}`);
-  const raw: Record<string, unknown>[] = await res.json();
-  return raw.map(toMetadataEntry);
+// ---------------------------------------------------------------------------
+// Records API
+// ---------------------------------------------------------------------------
+
+export async function fetchRecords(params?: {
+  type?: string;
+  category?: string;
+  session_id?: string;
+  status?: string;
+}): Promise<MetadataRecord[]> {
+  const searchParams = new URLSearchParams();
+  if (params?.type) searchParams.set('type', params.type);
+  if (params?.category) searchParams.set('category', params.category);
+  if (params?.session_id) searchParams.set('session_id', params.session_id);
+  if (params?.status) searchParams.set('status', params.status);
+
+  const qs = searchParams.toString();
+  const res = await fetch(`${API_BASE}/records${qs ? `?${qs}` : ''}`);
+  if (!res.ok) throw new Error(`Failed to fetch records: ${res.status}`);
+  return res.json();
 }
 
-export async function updateMetadataField(sessionId: string, field: string, value: Record<string, unknown>): Promise<void> {
-  const res = await fetch(`${API_BASE}/metadata/${sessionId}/fields`, {
+export async function fetchRecord(recordId: string): Promise<MetadataRecord> {
+  const res = await fetch(`${API_BASE}/records/${recordId}`);
+  if (!res.ok) throw new Error(`Failed to fetch record: ${res.status}`);
+  return res.json();
+}
+
+export async function updateRecordData(recordId: string, data: Record<string, unknown>): Promise<MetadataRecord> {
+  const res = await fetch(`${API_BASE}/records/${recordId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ field, value }),
+    body: JSON.stringify({ data }),
   });
-  if (!res.ok) throw new Error(`Failed to update field: ${res.status}`);
+  if (!res.ok) throw new Error(`Failed to update record: ${res.status}`);
+  return res.json();
 }
 
-export async function confirmMetadata(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/metadata/${id}/confirm`, {
+export async function confirmRecord(recordId: string): Promise<MetadataRecord> {
+  const res = await fetch(`${API_BASE}/records/${recordId}/confirm`, { method: 'POST' });
+  if (!res.ok) throw new Error(`Failed to confirm record: ${res.status}`);
+  return res.json();
+}
+
+export async function deleteRecord(recordId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/records/${recordId}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(`Failed to delete record: ${res.status}`);
+}
+
+export async function linkRecords(sourceId: string, targetId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/records/link`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
   });
-  if (!res.ok) throw new Error(`Failed to confirm metadata: ${res.status}`);
+  if (!res.ok) throw new Error(`Failed to link records: ${res.status}`);
+}
+
+export async function fetchSessionRecords(sessionId: string): Promise<MetadataRecord[]> {
+  const res = await fetch(`${API_BASE}/sessions/${sessionId}/records`);
+  if (!res.ok) throw new Error(`Failed to fetch session records: ${res.status}`);
+  return res.json();
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
@@ -185,4 +205,19 @@ export async function fetchSessions(): Promise<Session[]> {
   const res = await fetch(`${API_BASE}/sessions`);
   if (!res.ok) throw new Error(`Failed to fetch sessions: ${res.status}`);
   return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Legacy compat — MetadataEntry shape used by old dashboard code
+// ---------------------------------------------------------------------------
+
+export interface MetadataEntry {
+  id: string;
+  subject_id: string;
+  session_id: string;
+  status: 'draft' | 'confirmed';
+  fields: Record<string, unknown>;
+  validation: ValidationResults | null;
+  created_at: string;
+  updated_at: string;
 }

@@ -6,11 +6,14 @@ Build a real-time metadata capture and validation platform for AIND using the **
 ## MVP Scope
 - **Text-based metadata capture** via conversational chat interface
 - **NLP extraction** of structured metadata from free-text scientist input
+- **Granular metadata records** — each metadata type (subject, procedures, etc.) stored as its own record
+- **Shared vs asset-specific** — subjects, instruments, procedures, rigs reusable across experiments
+- **Cross-session linking** — shared records can be linked from multiple chat sessions
 - **Schema validation** against AIND's live metadata database (read-only via MCP)
 - **External registry validation** (Addgene, NCBI GenBank, MGI)
-- **Proactive prompting** for missing/incomplete fields
-- **Dashboard** for reviewing and confirming captured metadata
-- **Local SQLite** for draft metadata storage (future: AIND MongoDB write access)
+- **Context-aware prompting** — agent only asks about metadata relevant to current conversation
+- **Dashboard** with session view + library view for reviewing and confirming metadata
+- **Local SQLite** for metadata storage (future: AIND MongoDB write access)
 
 Multi-modal (audio, image, video) deferred to post-MVP.
 
@@ -69,28 +72,29 @@ Multi-modal (audio, image, video) deferred to post-MVP.
 ```
 metadata-capture/
 ├── agent/                          # Claude Agent SDK service
-│   ├── server.py                   # FastAPI: POST /chat (SSE), GET/PUT /metadata, GET /sessions, GET /health
+│   ├── server.py                   # FastAPI: /chat (SSE), /records CRUD, /sessions, /health, /models
 │   ├── service.py                  # Core agent: streaming query(), token-level StreamEvent handling
-│   ├── validation.py               # Schema validation: required fields, enums, formats, cross-field
+│   ├── validation.py               # Per-record-type validation: required fields, enums, formats
 │   ├── prompts/
-│   │   └── system_prompt.py        # AIND schema context + extraction instructions
+│   │   └── system_prompt.py        # Context-aware AIND schema + granular record instructions
 │   ├── tools/
-│   │   ├── metadata_store.py       # SQLite CRUD: save/load/update/confirm drafts
+│   │   ├── metadata_store.py       # SQLite CRUD: records, links, sessions, conversations
+│   │   ├── capture_mcp.py          # MCP tools: capture_metadata, find_records, link_records
 │   │   └── registry_lookup.py      # Addgene, NCBI, MGI API wrappers
 │   ├── db/
 │   │   ├── database.py             # Async SQLite (aiosqlite, WAL mode)
-│   │   └── models.py               # DDL: draft_metadata + conversations tables
+│   │   └── models.py               # DDL: metadata_records + record_links + conversations
 │   └── requirements.txt
 │
 ├── frontend/                       # Next.js 14 + TypeScript + Tailwind CSS
 │   ├── app/
 │   │   ├── page.tsx                # Three-pane layout: sessions sidebar | chat | metadata sidebar
-│   │   ├── dashboard/page.tsx      # Inline-editable metadata dashboard with schema placeholders
+│   │   ├── dashboard/page.tsx      # Dashboard with session view + library view toggle
 │   │   ├── components/
 │   │   │   ├── Header.tsx          # Shared nav bar + live Agent Online/Offline health indicator
-│   │   │   ├── ChatPanel.tsx       # Token-streaming chat, stop button, auto-expanding input
+│   │   │   ├── ChatPanel.tsx       # Token-streaming chat, model selector, tool progress indicators
 │   │   │   ├── SessionsSidebar.tsx # Chat history list with first-message titles
-│   │   │   └── MetadataSidebar.tsx # Clickable metadata cards linking to dashboard
+│   │   │   └── MetadataSidebar.tsx # Records grouped by type (shared/asset) with status badges
 │   │   └── lib/api.ts              # API client: chat (SSE + AbortSignal), metadata CRUD, sessions
 │   └── package.json
 │
@@ -109,15 +113,17 @@ metadata-capture/
 - Claude Agent SDK with `query()` for streaming responses
 - FastAPI wrapper: POST /chat (SSE), GET /metadata, PUT /metadata/{id}/fields, POST /metadata/{id}/confirm, GET /sessions/{id}/messages, GET /health
 - System prompt with AIND schema context
-- Model: `claude-opus-4-5-20251101`
+- Model: `claude-opus-4-6`
 
 ### Phase 2: Local Storage + Custom Tools ✅
 **Files:** `agent/db/`, `agent/tools/metadata_store.py`
 
 - SQLite with async aiosqlite (WAL mode)
-- Draft metadata table with 9 JSON columns per schema section
-- Conversations table for multi-turn history
-- CRUD tools: save/get/update/list/confirm drafts
+- `metadata_records` table: one row per typed record (subject, procedures, session, etc.)
+- `record_links` table: explicit many-to-many links between records
+- `conversations` table for multi-turn history
+- Category system: shared (subject, procedures, instrument, rig) vs asset (data_description, session, etc.)
+- CRUD: create/get/update/list/confirm/delete records + link/unlink/find
 
 ### Phase 3: Validation Engine ✅ (partial)
 **Files:** `agent/validation.py`, `agent/tools/registry_lookup.py`, `agent/tools/capture_mcp.py`
@@ -134,15 +140,15 @@ Not yet done:
 - Deeper schema validation via `aind-data-schema` Pydantic models
 - Validation feedback loop into agent conversation for proactive prompting
 
-### Phase 3.5: Tool-Based Extraction ✅ (NEW)
+### Phase 3.5: Tool-Based Extraction ✅ → Granular Records ✅
 **Files:** `agent/tools/capture_mcp.py`, `agent/service.py`, `agent/prompts/system_prompt.py`
 
-Migrated from regex-based post-processing extraction to Claude-native tool calls:
-- Created `capture_metadata` MCP tool that Claude calls directly during conversation
-- Claude extracts metadata and persists it via tool calls (not regex scraping)
-- Removed `_extract_metadata_fields()` regex function
-- Updated system prompt with tool usage instructions
-- Updated evals to test tool handler instead of regex patterns
+Three MCP tools for metadata capture:
+- `capture_metadata`: Save/update a single typed record (one record_type per call)
+- `find_records`: Search existing records to avoid duplicates (supports type, query, category filters)
+- `link_records`: Create explicit links between records (e.g., session ↔ subject)
+- System prompt instructs agent to be context-aware: only ask about metadata the user is discussing
+- Agent reuses shared records across sessions via find_records before creating duplicates
 
 ### Phase 4: Frontend — Chat Interface ✅
 **Files:** `frontend/app/page.tsx`, `frontend/app/components/`
@@ -159,15 +165,15 @@ Migrated from regex-based post-processing extraction to Claude-native tool calls
 ### Phase 5: Frontend — Dashboard ✅
 **Files:** `frontend/app/dashboard/page.tsx`
 
-- Table of all draft metadata entries with status tracking
-- Expandable rows auto-expand when navigated via hash (`/dashboard#<session_id>`)
-- **Inline editing**: click any value to edit it; saves on Enter or blur
-- **Rename fields**: click any field label to rename the underlying key
-- **Delete fields**: trash icon appears on hover; removes the key from the section
-- **Add fields**: `+ Add field` row at the bottom of every section; Tab from name to value
-- **Schema placeholders**: empty sections show known fields (Subject ID, Species, Sex, etc.) as "click to add" rows — no JSON editor needed
-- Confirm button, filter by status, search
-- Shared `Header` component with live Agent Online / Offline indicator (polls `/health` every 5 s)
+- **Session view**: table grouped by chat session, expandable rows showing per-session records
+- **Library view**: records grouped by type (Shared: subjects, procedures, instruments, rigs; Asset: sessions, etc.)
+- Toggle between views with a segmented control
+- **Inline editing**: click any value to edit; saves on Enter or blur
+- **Delete fields**: trash icon on hover
+- **Add fields**: `+ Add field` row at the bottom of every record
+- **Schema placeholders**: known fields shown as "click to add" rows
+- Confirm individual records, filter by status, search
+- Shared `Header` with live Agent Online / Offline indicator (polls `/health` every 5 s)
 
 ### Phase 6: Streaming & UX Polish ✅
 **Files:** `agent/service.py`, `frontend/app/components/ChatPanel.tsx`, `frontend/tailwind.config.ts`
@@ -187,10 +193,12 @@ Migrated from regex-based post-processing extraction to Claude-native tool calls
 | Frontend | Next.js 14 + TypeScript + Tailwind | App Router, SSE streaming, mobile-responsive |
 | API layer | FastAPI wrapping SDK `query()` | Async streaming, Python ecosystem match |
 | Local DB | SQLite via aiosqlite | Zero-config MVP, WAL mode for concurrency |
-| Model | claude-opus-4-5-20251101 | Most capable for complex metadata extraction |
+| Model | claude-opus-4-6 | Most capable for complex metadata extraction |
 | Streaming | SDK `include_partial_messages` + `StreamEvent` | Token-by-token deltas without buffering full messages |
 | Stop streaming | `AbortController` + `AbortSignal` on fetch | Cleanly closes SSE connection; partial response stays visible |
-| Inline editing | `deepSet` / `renameKey` / `deleteKey` + PUT endpoint | Per-field granularity; auto-saves on blur, no full-page reload |
+| Metadata granularity | One record per type (shared vs asset) | Context-aware capture; no irrelevant follow-ups |
+| Record linking | Explicit `record_links` table | Cross-session reuse of subjects, instruments, rigs |
+| Inline editing | Per-record PUT endpoint | Auto-saves on blur, no full-page reload |
 | Session titles | First user message from DB | Matches Claude desktop UX; no extra LLM call needed |
 | Auth | None for MVP | Add Allen SSO later |
 

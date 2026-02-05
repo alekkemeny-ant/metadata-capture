@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 from agent.service import chat
-from agent.tools.metadata_store import get_draft_metadata
+from agent.tools.metadata_store import get_session_records
 from agent.db.database import init_db, close_db
 
 
@@ -88,21 +88,23 @@ def test_agent_extracts_metadata(case: dict[str, Any]) -> None:
     # Run the agent
     _run_async(_consume_chat(session_id, user_input))
 
-    # Check SQLite for expected fields
-    draft = _run_async(get_draft_metadata(session_id))
+    # Check records created for this session
+    records = _run_async(get_session_records(session_id))
 
     if not expected:
-        # For cases with empty expected, just verify no crash
         return
 
-    assert draft is not None, f"No draft found for session {session_id}"
+    assert len(records) > 0, f"No records found for session {session_id}"
 
-    # Check each expected top-level field
+    # Build a map of record_type -> data for comparison
+    records_by_type: dict[str, dict[str, Any]] = {}
+    for r in records:
+        records_by_type[r["record_type"]] = r.get("data_json", {})
+
+    # Check each expected top-level field (which maps to a record_type)
     for key, expected_value in expected.items():
-        json_key = f"{key}_json"
-        saved_value = draft.get(json_key)
-        assert saved_value is not None, f"Field {key} not saved (input: {user_input!r})"
-        _assert_fields_match(saved_value, expected_value, key)
+        assert key in records_by_type, f"No {key} record found (input: {user_input!r})"
+        _assert_fields_match(records_by_type[key], expected_value, key)
 
 
 @pytest.mark.llm
@@ -112,23 +114,16 @@ def test_agent_extracts_metadata(case: dict[str, Any]) -> None:
     ids=[c["id"] for c in _CASES if c.get("absent_keys")],
 )
 def test_agent_does_not_extract_absent_keys(case: dict[str, Any]) -> None:
-    """Test that agent does NOT extract certain fields (guards against false positives)."""
+    """Test that agent does NOT extract certain fields."""
     session_id = f"test-absent-{case['id']}"
     user_input = case["input"]
     absent_keys = case["absent_keys"]
 
-    # Run the agent
     _run_async(_consume_chat(session_id, user_input))
 
-    # Check SQLite
-    draft = _run_async(get_draft_metadata(session_id))
-
-    if draft is None:
-        # No draft means nothing was extracted, which is correct
-        return
+    records = _run_async(get_session_records(session_id))
+    records_by_type = {r["record_type"] for r in records}
 
     for key in absent_keys:
-        json_key = f"{key}_json"
-        saved_value = draft.get(json_key)
-        assert saved_value is None or saved_value == {}, \
-            f"Field {key} should NOT be extracted from: {user_input!r}"
+        assert key not in records_by_type, \
+            f"Record type {key} should NOT be created from: {user_input!r}"

@@ -11,15 +11,14 @@ from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
     StreamEvent,
+    TextBlock,
 )
 
 from .prompts.system_prompt import SYSTEM_PROMPT
 from .tools.capture_mcp import capture_server
 from .tools.metadata_store import (
-    confirm_metadata,
     get_conversation_history,
-    get_draft_metadata,
-    list_all_drafts,
+    get_session_records,
     save_conversation_turn,
 )
 
@@ -29,7 +28,16 @@ logger = logging.getLogger(__name__)
 MCP_SERVER_DIR = Path(__file__).resolve().parent.parent / "aind-metadata-mcp"
 
 
-def _build_options() -> ClaudeAgentOptions:
+DEFAULT_MODEL = "claude-opus-4-6"
+
+AVAILABLE_MODELS = [
+    "claude-opus-4-6",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
+]
+
+
+def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     """Build the ClaudeAgentOptions for the metadata agent."""
     # MCP tool names are prefixed with "mcp__<server-name>__"
     aind_mcp_tools = [
@@ -55,8 +63,12 @@ def _build_options() -> ClaudeAgentOptions:
         "mcp__aind-metadata-mcp__identify_nwb_contents_with_s3_link",
     ]
 
-    # Capture tool for metadata extraction
-    capture_tool = "mcp__capture__capture_metadata"
+    # Capture tools (capture_metadata, find_records, link_records)
+    capture_tools = [
+        "mcp__capture__capture_metadata",
+        "mcp__capture__find_records",
+        "mcp__capture__link_records",
+    ]
 
     # Combine all MCP servers
     mcp_servers: dict[str, Any] = {
@@ -77,9 +89,9 @@ def _build_options() -> ClaudeAgentOptions:
 
     opts = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
-        allowed_tools=["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", capture_tool] + aind_mcp_tools,
+        allowed_tools=["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch"] + capture_tools + aind_mcp_tools,
         max_turns=5,
-        model="claude-opus-4-5-20251101",
+        model=model if model in AVAILABLE_MODELS else DEFAULT_MODEL,
         mcp_servers=mcp_servers,
         include_partial_messages=True,
     )
@@ -102,11 +114,22 @@ def _format_conversation_context(history: list[dict[str, Any]], user_message: st
     return "\n".join(parts)
 
 
-async def _create_message_stream(prompt: str):
-    """Create an async generator for streaming input to the SDK.
+def _format_records_context(records: list[dict[str, Any]]) -> str:
+    """Format existing records as context for the agent prompt."""
+    if not records:
+        return ""
 
-    Custom MCP tools require streaming input mode.
-    """
+    parts = ["\nExisting metadata records for this session:"]
+    for r in records:
+        data = r.get("data_json", {})
+        name = r.get("name", "unnamed")
+        parts.append(f"- [{r['record_type']}] id={r['id']} name=\"{name}\" data={json.dumps(data, default=str)}")
+
+    return "\n".join(parts)
+
+
+async def _create_message_stream(prompt: str):
+    """Create an async generator for streaming input to the SDK."""
     yield {
         "type": "user",
         "message": {
@@ -116,20 +139,13 @@ async def _create_message_stream(prompt: str):
     }
 
 
-async def chat(session_id: str, user_message: str) -> AsyncIterator[dict[str, Any]]:
+async def chat(session_id: str, user_message: str, model: str | None = None) -> AsyncIterator[dict[str, Any]]:
     """Process a chat message and stream the agent's response.
 
     Yields dicts with keys:
     - {"content": str} for text chunks
     - {"session_id": str} sent once at the start
     - {"done": True} when complete
-
-    Parameters
-    ----------
-    session_id : str
-        The session identifier for conversation tracking.
-    user_message : str
-        The user's message.
     """
     # Save the user's message
     await save_conversation_turn(session_id, "user", user_message)
@@ -139,22 +155,24 @@ async def chat(session_id: str, user_message: str) -> AsyncIterator[dict[str, An
 
     # Build conversation context
     history = await get_conversation_history(session_id)
-    # Exclude the message we just saved (it's the last one)
     prior_history = history[:-1] if history else []
     prompt = _format_conversation_context(prior_history, user_message)
 
-    # Add context about current draft and session_id for the capture tool
-    draft = await get_draft_metadata(session_id)
-    if draft:
-        draft_summary = {k: v for k, v in draft.items() if v is not None and k not in ("id", "created_at", "updated_at")}
-        prompt += f"\n\nCurrent draft metadata for this session:\n{json.dumps(draft_summary, indent=2, default=str)}"
+    # Add context about existing records for this session
+    records = await get_session_records(session_id)
+    if records:
+        prompt += _format_records_context(records)
 
-    # Add session_id context for the capture_metadata tool
+    # Add session_id context for the capture tools
     prompt += f"\n\nIMPORTANT: When calling capture_metadata, always use session_id=\"{session_id}\""
 
     # Run the agent with streaming input (required for custom MCP tools)
-    options = _build_options()
+    options = _build_options(model=model)
     full_response: list[str] = []
+
+    # Track how much text was streamed via deltas so we can detect
+    # AssistantMessages whose text wasn't streamed (e.g. post-tool turns).
+    streamed_len_before_msg = 0
 
     try:
         async for message in query(prompt=_create_message_stream(prompt), options=options):
@@ -186,11 +204,35 @@ async def chat(session_id: str, user_message: str) -> AsyncIterator[dict[str, An
                     yield {"block_stop": True}
 
             elif isinstance(message, AssistantMessage):
-                # Complete message — skip since we already streamed deltas
-                pass
+                # Check if this message has text that wasn't already streamed.
+                msg_text_parts: list[str] = []
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        msg_text_parts.append(block.text)
+
+                msg_text = "".join(msg_text_parts)
+                streamed_since = "".join(full_response[streamed_len_before_msg:])
+
+                if msg_text and msg_text != streamed_since:
+                    unstreamed = msg_text
+                    if streamed_since and msg_text.startswith(streamed_since):
+                        unstreamed = msg_text[len(streamed_since):]
+                    if unstreamed:
+                        logger.info(
+                            "Yielding %d chars of unstreamed text from AssistantMessage",
+                            len(unstreamed),
+                        )
+                        full_response.append(unstreamed)
+                        yield {"content": unstreamed}
+
+                streamed_len_before_msg = len(full_response)
+
             elif isinstance(message, ResultMessage):
-                # Final result — the capture_metadata tool handles persistence
-                pass
+                logger.info(
+                    "Query complete: %d turns, %s ms",
+                    message.num_turns,
+                    message.duration_ms,
+                )
     except Exception as exc:
         logger.exception("Agent query failed for session %s: %s", session_id, exc)
         error_msg = "I encountered an error processing your request. Please try again."
@@ -202,25 +244,12 @@ async def chat(session_id: str, user_message: str) -> AsyncIterator[dict[str, An
     if assistant_text.strip():
         await save_conversation_turn(session_id, "assistant", assistant_text)
 
-    # Note: Metadata extraction now happens via the capture_metadata tool
-    # which Claude calls directly during the conversation
-
     yield {"done": True}
 
 
 async def get_session_messages(session_id: str) -> list[dict[str, Any]]:
     """Get conversation history for a session."""
     return await get_conversation_history(session_id)
-
-
-async def get_all_drafts(status_filter: str | None = None) -> list[dict[str, Any]]:
-    """List all draft metadata entries."""
-    return await list_all_drafts(status_filter)
-
-
-async def confirm_draft(session_id: str) -> dict[str, Any] | None:
-    """Confirm the draft metadata for a session."""
-    return await confirm_metadata(session_id)
 
 
 async def get_sessions() -> list[dict[str, Any]]:
