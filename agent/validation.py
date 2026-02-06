@@ -1,10 +1,9 @@
-"""Schema validation for AIND metadata drafts.
+"""Schema validation for AIND metadata records.
 
-Validates extracted metadata against AIND schema rules:
+Validates extracted metadata against AIND schema rules on a per-record-type basis:
 - Required field checks
 - Enum validation (modality, sex, species)
 - Format validation (subject IDs, timestamps, coordinates)
-- Cross-field consistency checks
 """
 
 from __future__ import annotations
@@ -45,15 +44,18 @@ VALID_SPECIES = frozenset({
     "Danio rerio",
 })
 
-PHYSIOLOGY_MODALITIES = frozenset({
-    "ecephys", "pophys", "fib", "icephys", "slap",
-})
-
-REQUIRED_FIELDS = [
-    "subject.subject_id",
-    "data_description.modality",
-    "data_description.project_name",
-]
+# Required fields per record type (dot paths within the record's data_json)
+REQUIRED_FIELDS_BY_TYPE: dict[str, list[str]] = {
+    "subject": ["subject_id"],
+    "data_description": ["modality", "project_name"],
+    "session": ["session_start_time"],
+    "procedures": [],
+    "instrument": [],
+    "acquisition": [],
+    "processing": [],
+    "quality_control": [],
+    "rig": [],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +77,10 @@ class ValidationIssue:
 
 
 class ValidationResult:
-    """Aggregated validation result for a metadata draft."""
+    """Aggregated validation result for a metadata record."""
 
-    def __init__(self) -> None:
+    def __init__(self, record_type: str = "unknown") -> None:
+        self.record_type = record_type
         self.issues: list[ValidationIssue] = []
         self.missing_required: list[str] = []
         self.valid_fields: list[str] = []
@@ -92,7 +95,8 @@ class ValidationResult:
 
     @property
     def completeness_score(self) -> float:
-        total = len(REQUIRED_FIELDS)
+        required = REQUIRED_FIELDS_BY_TYPE.get(self.record_type, [])
+        total = len(required)
         if total == 0:
             return 1.0
         present = total - len(self.missing_required)
@@ -111,6 +115,7 @@ class ValidationResult:
         return {
             "status": self.status,
             "completeness_score": self.completeness_score,
+            "record_type": self.record_type,
             "errors": [i.to_dict() for i in self.issues if i.severity == "error"],
             "warnings": [i.to_dict() for i in self.issues if i.severity == "warning"],
             "missing_required": self.missing_required,
@@ -123,10 +128,7 @@ class ValidationResult:
 # ---------------------------------------------------------------------------
 
 def _get_nested(data: dict, path: str) -> Any:
-    """Get a value from a nested dict using dot notation.
-
-    'subject.subject_id' -> data['subject']['subject_id']
-    """
+    """Get a value from a nested dict using dot notation."""
     parts = path.split(".")
     current: Any = data
     for part in parts:
@@ -137,125 +139,88 @@ def _get_nested(data: dict, path: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Individual validators
+# Per-type validators
 # ---------------------------------------------------------------------------
 
-def _check_required_fields(metadata: dict, result: ValidationResult) -> None:
-    """Check that all required fields are present."""
-    for field_path in REQUIRED_FIELDS:
-        value = _get_nested(metadata, field_path)
+def _check_required_fields(record_type: str, data: dict, result: ValidationResult) -> None:
+    """Check that all required fields for this record type are present."""
+    for field_path in REQUIRED_FIELDS_BY_TYPE.get(record_type, []):
+        value = _get_nested(data, field_path)
         if value is None or value == "" or value == []:
             result.missing_required.append(field_path)
         else:
             result.add_valid(field_path)
 
 
-def _validate_subject(metadata: dict, result: ValidationResult) -> None:
+def _validate_subject(data: dict, result: ValidationResult) -> None:
     """Validate subject fields."""
-    subject = metadata.get("subject")
-    if not subject or not isinstance(subject, dict):
-        return
-
-    # subject_id: should be numeric, 4+ digits
-    sid = subject.get("subject_id")
+    sid = data.get("subject_id")
     if sid is not None:
         if not re.match(r"^\d{4,}$", str(sid)):
             result.add_warning(
-                "subject.subject_id",
+                "subject_id",
                 f"Subject ID '{sid}' should be a numeric string with 4+ digits",
             )
         else:
-            result.add_valid("subject.subject_id")
+            result.add_valid("subject_id")
 
-    # sex
-    sex = subject.get("sex")
+    sex = data.get("sex")
     if sex is not None:
         if sex not in VALID_SEX:
             result.add_error(
-                "subject.sex",
+                "sex",
                 f"Invalid sex '{sex}'. Must be one of: {', '.join(sorted(VALID_SEX))}",
             )
         else:
-            result.add_valid("subject.sex")
+            result.add_valid("sex")
 
-    # species
-    species = subject.get("species")
+    species = data.get("species")
     if isinstance(species, dict):
         name = species.get("name")
         if name is not None and name not in VALID_SPECIES:
             result.add_warning(
-                "subject.species.name",
+                "species.name",
                 f"Unrecognized species '{name}'. Expected one of: {', '.join(sorted(VALID_SPECIES))}",
             )
         elif name is not None:
-            result.add_valid("subject.species.name")
+            result.add_valid("species.name")
 
 
-def _validate_data_description(metadata: dict, result: ValidationResult) -> None:
+def _validate_data_description(data: dict, result: ValidationResult) -> None:
     """Validate data_description fields."""
-    dd = metadata.get("data_description")
-    if not dd or not isinstance(dd, dict):
-        return
-
-    # modality
-    modality = dd.get("modality")
+    modality = data.get("modality")
     if isinstance(modality, list):
         for i, mod in enumerate(modality):
             if isinstance(mod, dict):
                 abbr = mod.get("abbreviation")
                 if abbr is not None and abbr not in VALID_MODALITIES:
                     result.add_error(
-                        f"data_description.modality[{i}].abbreviation",
+                        f"modality[{i}].abbreviation",
                         f"Invalid modality '{abbr}'. Must be one of: {', '.join(sorted(VALID_MODALITIES))}",
                     )
                 elif abbr is not None:
-                    result.add_valid(f"data_description.modality[{i}].abbreviation")
+                    result.add_valid(f"modality[{i}].abbreviation")
 
-    # project_name
-    pn = dd.get("project_name")
+    pn = data.get("project_name")
     if pn is not None:
         if len(pn.strip()) < 2:
-            result.add_warning(
-                "data_description.project_name",
-                "Project name is too short",
-            )
+            result.add_warning("project_name", "Project name is too short")
         else:
-            result.add_valid("data_description.project_name")
+            result.add_valid("project_name")
 
 
-def _validate_session(metadata: dict, result: ValidationResult) -> None:
+def _validate_session(data: dict, result: ValidationResult) -> None:
     """Validate session fields."""
-    session = metadata.get("session")
-    if not session:
-        # If modality is physiology-based, session times are expected
-        dd = metadata.get("data_description") or {}
-        if not isinstance(dd, dict):
-            return
-        modality = dd.get("modality", [])
-        if isinstance(modality, list):
-            for mod in modality:
-                if isinstance(mod, dict) and mod.get("abbreviation") in PHYSIOLOGY_MODALITIES:
-                    result.add_warning(
-                        "session",
-                        f"Session information expected for physiology modality '{mod.get('abbreviation')}'",
-                    )
-        return
-
-    if not isinstance(session, dict):
-        return
-
-    start = session.get("session_start_time")
-    end = session.get("session_end_time")
+    start = data.get("session_start_time")
+    end = data.get("session_end_time")
 
     if start is not None:
-        result.add_valid("session.session_start_time")
+        result.add_valid("session_start_time")
     if end is not None:
-        result.add_valid("session.session_end_time")
+        result.add_valid("session_end_time")
 
-    # Check end > start if both are full datetime strings
     if start and end:
         try:
-            # Try parsing ISO 8601
             fmt_patterns = [
                 "%Y-%m-%dT%H:%M:%S",
                 "%Y-%m-%dT%H:%M:%S.%f",
@@ -279,87 +244,96 @@ def _validate_session(metadata: dict, result: ValidationResult) -> None:
 
             if start_dt and end_dt and end_dt <= start_dt:
                 result.add_error(
-                    "session.session_end_time",
+                    "session_end_time",
                     "Session end time must be after start time",
                 )
         except Exception:
-            pass  # Can't parse, skip comparison
+            pass
 
-    # rig_id format check
-    rig_id = session.get("rig_id")
+    rig_id = data.get("rig_id")
     if rig_id is not None:
-        result.add_valid("session.rig_id")
+        result.add_valid("rig_id")
 
 
-def _validate_procedures(metadata: dict, result: ValidationResult) -> None:
+def _validate_procedures(data: dict, result: ValidationResult) -> None:
     """Validate procedures fields."""
-    procedures = metadata.get("procedures")
-    if not procedures or not isinstance(procedures, dict):
-        return
-
-    # protocol_id
-    pid = procedures.get("protocol_id")
+    pid = data.get("protocol_id")
     if pid is not None:
-        result.add_valid("procedures.protocol_id")
+        result.add_valid("protocol_id")
 
-    # coordinates
-    coords = procedures.get("coordinates")
+    coords = data.get("coordinates")
     if isinstance(coords, dict):
         x, y = coords.get("x"), coords.get("y")
         if x is not None and y is not None:
             try:
                 float(x)
                 float(y)
-                result.add_valid("procedures.coordinates")
+                result.add_valid("coordinates")
             except (ValueError, TypeError):
                 result.add_error(
-                    "procedures.coordinates",
+                    "coordinates",
                     f"Coordinates must be numeric, got x={x}, y={y}",
                 )
 
-    # section_thickness_um
-    thickness = procedures.get("section_thickness_um")
+    thickness = data.get("section_thickness_um")
     if thickness is not None:
         try:
             val = float(thickness)
             if val <= 0:
-                result.add_error(
-                    "procedures.section_thickness_um",
-                    "Section thickness must be positive",
-                )
+                result.add_error("section_thickness_um", "Section thickness must be positive")
             else:
-                result.add_valid("procedures.section_thickness_um")
+                result.add_valid("section_thickness_um")
         except (ValueError, TypeError):
             result.add_error(
-                "procedures.section_thickness_um",
+                "section_thickness_um",
                 f"Section thickness must be numeric, got '{thickness}'",
             )
+
+
+# Type -> validator function mapping
+_VALIDATORS: dict[str, Any] = {
+    "subject": _validate_subject,
+    "data_description": _validate_data_description,
+    "session": _validate_session,
+    "procedures": _validate_procedures,
+}
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def validate_metadata(metadata: dict[str, Any]) -> ValidationResult:
-    """Run all validation rules against extracted metadata.
+def validate_record(record_type: str, data: dict[str, Any]) -> ValidationResult:
+    """Run validation rules for a single metadata record.
 
     Parameters
     ----------
-    metadata : dict
-        Extracted metadata with top-level keys like 'subject', 'session',
-        'data_description', 'procedures', etc.
+    record_type : str
+        The type of record (e.g., 'subject', 'session').
+    data : dict
+        The record's data_json content.
 
     Returns
     -------
     ValidationResult
-        Aggregated validation result with status, issues, and completeness score.
+        Validation result with status, issues, and completeness score.
     """
-    result = ValidationResult()
+    result = ValidationResult(record_type)
+    _check_required_fields(record_type, data, result)
 
-    _check_required_fields(metadata, result)
-    _validate_subject(metadata, result)
-    _validate_data_description(metadata, result)
-    _validate_session(metadata, result)
-    _validate_procedures(metadata, result)
+    validator = _VALIDATORS.get(record_type)
+    if validator:
+        validator(data, result)
 
+    return result
+
+
+# Keep backward compat alias for any callers using the old name
+def validate_metadata(metadata: dict[str, Any]) -> ValidationResult:
+    """Legacy wrapper — validates fields across multiple record types."""
+    result = ValidationResult("subject")
+    for record_type, data in metadata.items():
+        if isinstance(data, dict) and record_type in _VALIDATORS:
+            _check_required_fields(record_type, data, result)
+            _VALIDATORS[record_type](data, result)
     return result
