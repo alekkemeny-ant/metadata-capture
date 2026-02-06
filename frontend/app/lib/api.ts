@@ -105,7 +105,8 @@ export async function sendChatMessage(
             }
             // Forward any content-bearing event to the chunk handler
             if (parsed.content || parsed.thinking_start || parsed.thinking ||
-                parsed.tool_use_start || parsed.tool_use_input || parsed.block_stop) {
+                parsed.tool_use_start || parsed.tool_use_input || parsed.block_stop ||
+                parsed.tool_result) {
               onChunk(parsed);
             }
           } catch {

@@ -75,6 +75,8 @@ metadata-capture/
 │   ├── server.py                   # FastAPI: /chat (SSE), /records CRUD, /sessions, /health, /models
 │   ├── service.py                  # Core agent: streaming query(), token-level StreamEvent handling
 │   ├── validation.py               # Per-record-type validation: required fields, enums, formats
+│   ├── schema_info.py              # Schema introspection from aind-data-schema Pydantic models
+│   ├── shared.py                   # Shared async state (validation event queue between tool & stream)
 │   ├── prompts/
 │   │   └── system_prompt.py        # Context-aware AIND schema + granular record instructions
 │   ├── tools/
@@ -126,17 +128,20 @@ metadata-capture/
 - CRUD: create/get/update/list/confirm/delete records + link/unlink/find
 
 ### Phase 3: Validation Engine ✅ (partial)
-**Files:** `agent/validation.py`, `agent/tools/registry_lookup.py`, `agent/tools/capture_mcp.py`
+**Files:** `agent/validation.py`, `agent/schema_info.py`, `agent/shared.py`, `agent/tools/registry_lookup.py`, `agent/tools/capture_mcp.py`
 
 Done:
 - Per-record-type validation: required fields, enum checks, format rules, completeness scoring
 - External registry lookups: Addgene (catalog + search), NCBI E-utilities, MGI quick search
 - Auto-validation after every metadata capture/update via the `capture_metadata` tool
 - Validation results stored per-record in `validation_json`
+- Schema-derived enums via `aind-data-schema` Pydantic model introspection (modalities, species, sex)
+- Unknown-field warnings for fields not in the canonical schema
+- Inline validation display in chat tool dropdowns (errors/warnings shown with colored badges)
+- Validation results streamed back to frontend via `tool_result` SSE events using async queue
 
 Not yet done:
 - Automatic registry validation in extraction pipeline (functions exist but not auto-triggered)
-- Deeper schema validation via `aind-data-schema` Pydantic models
 - Validation feedback loop into agent conversation for proactive prompting
 
 ### Phase 3.5: Tool-Based Extraction ✅ → Granular Records ✅
@@ -180,6 +185,9 @@ Three MCP tools for metadata capture:
 - Enabled `include_partial_messages` on the SDK; yield `content_block_delta` text tokens directly
 - Replaced generic blue palette with warm Anthropic-inspired light theme (sand neutrals, terracotta `#D97757` accent)
 - Streaming cursor uses a blinking filled circle in the accent color
+- Tool dropdowns show inline validation results: red X for errors, amber triangle for warnings
+- `capture_metadata` tool results auto-expand when validation issues are found
+- Validation streamed to frontend via `tool_result` SSE events (async queue piped from MCP tool handler)
 
 ---
 
@@ -199,6 +207,8 @@ Three MCP tools for metadata capture:
 | Record linking | Explicit `record_links` table | Cross-session reuse of subjects, instruments, rigs |
 | Inline editing | Per-record PUT endpoint | Auto-saves on blur, no full-page reload |
 | Session titles | First user message from DB | Matches Claude desktop UX; no extra LLM call needed |
+| Schema validation | `aind-data-schema` Pydantic introspection | Canonical enums + unknown-field checks, no hardcoded drift |
+| Validation display | `tool_result` SSE + `contextvars` queue | Tool handler pushes results; stream drains them inline |
 | Auth | None for MVP | Add Allen SSO later |
 
 ---
@@ -232,7 +242,6 @@ python3 -m pytest evals/tasks/validation/ -v -m network            # registry lo
 
 ## Future Work
 - Auto-trigger registry lookups (Addgene, NCBI, MGI) when relevant fields are extracted
-- Deeper schema validation via `aind-data-schema` Pydantic models
 - Feed validation results back into agent conversation for proactive prompting
 - Multi-modal input (audio, image, video, documents)
 - MCP write access to AIND MongoDB

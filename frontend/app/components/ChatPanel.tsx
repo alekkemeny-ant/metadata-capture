@@ -9,10 +9,24 @@ import { sendChatMessage, fetchMessages, fetchModels, ChatMessage } from '../lib
 // Block types for structured assistant messages
 // ---------------------------------------------------------------------------
 
+interface ValidationIssue {
+  field: string;
+  message: string;
+  severity: string;
+}
+
+interface ToolValidation {
+  status: string;
+  errors: ValidationIssue[];
+  warnings: ValidationIssue[];
+}
+
 interface MessageBlock {
   type: 'text' | 'thinking' | 'tool_use';
   content: string;
-  name?: string; // tool name, only for tool_use
+  name?: string;       // tool name, only for tool_use
+  toolUseId?: string;  // tool use ID, for matching results
+  validation?: ToolValidation; // validation result from capture_metadata
 }
 
 interface StructuredMessage {
@@ -88,15 +102,57 @@ function ElapsedTimer() {
   );
 }
 
-function ToolUseBlock({ name, content, isStreaming }: { name: string; content: string; isStreaming?: boolean }) {
+function ValidationBadges({ validation }: { validation: ToolValidation }) {
+  const { errors, warnings } = validation;
+  if (errors.length === 0 && warnings.length === 0) return null;
+  return (
+    <div className="px-3 py-2 border-t border-sand-100 space-y-1">
+      {errors.map((e, i) => (
+        <div key={`e-${i}`} className="flex items-start gap-1.5 text-xs">
+          <svg className="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg>
+          <span className="text-red-700"><span className="font-medium">{e.field}:</span> {e.message}</span>
+        </div>
+      ))}
+      {warnings.map((w, i) => (
+        <div key={`w-${i}`} className="flex items-start gap-1.5 text-xs">
+          <svg className="w-3.5 h-3.5 text-amber-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          <span className="text-amber-700"><span className="font-medium">{w.field}:</span> {w.message}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ToolUseBlock({ name, content, isStreaming, validation }: { name: string; content: string; isStreaming?: boolean; validation?: ToolValidation }) {
+  const hasIssues = validation && (validation.errors.length > 0 || validation.warnings.length > 0);
   const [manualExpand, setManualExpand] = useState<boolean | null>(null);
-  // Auto-expand while streaming, auto-collapse when done; manual toggle overrides
-  const expanded = manualExpand !== null ? manualExpand : !!isStreaming;
+  // Auto-expand while streaming, or if there are validation issues; manual toggle overrides
+  const expanded = manualExpand !== null ? manualExpand : (!!isStreaming || !!hasIssues);
   let prettyInput = content;
   try { prettyInput = JSON.stringify(JSON.parse(content), null, 2); } catch { /* show raw */ }
+
+  // Choose icon based on validation status
+  const doneIcon = hasIssues && validation?.errors.length ? (
+    <svg className="w-3.5 h-3.5 text-red-500" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg>
+  ) : hasIssues ? (
+    <svg className="w-3.5 h-3.5 text-amber-500" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+  ) : (
+    <svg className="w-3.5 h-3.5 text-brand-aqua-500" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" /></svg>
+  );
+
+  // Choose label based on validation status
+  const doneLabel = hasIssues && validation?.errors.length
+    ? `Validation errors (${validation.errors.length})`
+    : hasIssues && validation?.warnings.length
+    ? `Metadata captured with warnings (${validation!.warnings.length})`
+    : getToolLabel(name, false);
+
   return (
     <div className={`my-1.5 rounded-lg overflow-hidden border transition-colors ${
-      isStreaming ? 'border-brand-fig/30 bg-brand-magenta-100/40' : 'border-sand-200'
+      isStreaming ? 'border-brand-fig/30 bg-brand-magenta-100/40'
+        : hasIssues && validation?.errors.length ? 'border-red-200 bg-red-50/30'
+        : hasIssues ? 'border-amber-200 bg-amber-50/30'
+        : 'border-sand-200'
     }`}>
       <button
         onClick={() => setManualExpand(expanded ? false : true)}
@@ -107,11 +163,9 @@ function ToolUseBlock({ name, content, isStreaming }: { name: string; content: s
             <span className="absolute inline-flex h-full w-full rounded-full bg-brand-fig/30 animate-ping" />
             <span className="relative inline-flex h-2 w-2 rounded-full bg-brand-fig" />
           </span>
-        ) : (
-          <svg className="w-3.5 h-3.5 text-brand-aqua-500" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" /></svg>
-        )}
+        ) : doneIcon}
         <span className={`text-xs font-medium ${isStreaming ? 'text-sand-700' : 'text-sand-500'}`}>
-          {getToolLabel(name, !!isStreaming)}
+          {isStreaming ? getToolLabel(name, true) : doneLabel}
         </span>
         {isStreaming && <ElapsedTimer />}
         {!isStreaming && (
@@ -123,6 +177,7 @@ function ToolUseBlock({ name, content, isStreaming }: { name: string; content: s
           <div className="h-full w-1/3 bg-brand-fig/40 rounded-full animate-shimmer" />
         </div>
       )}
+      {expanded && hasIssues && validation && <ValidationBadges validation={validation} />}
       {expanded && prettyInput && (
         <div className="px-3 py-2 text-xs font-mono text-sand-600 border-t border-sand-100 max-h-64 overflow-y-auto whitespace-pre-wrap bg-sand-50">
           {prettyInput}
@@ -266,12 +321,19 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
               blocks[blocks.length - 1] = { ...lastBlock, content: lastBlock.content + (event.thinking as string) };
             }
           } else if (event.tool_use_start) {
-            const info = event.tool_use_start as { name: string };
-            blocks.push({ type: 'tool_use', content: '', name: info.name });
+            const info = event.tool_use_start as { name: string; id: string };
+            blocks.push({ type: 'tool_use', content: '', name: info.name, toolUseId: info.id });
           } else if (event.tool_use_input) {
             const lastBlock = blocks[blocks.length - 1];
             if (lastBlock && lastBlock.type === 'tool_use') {
               blocks[blocks.length - 1] = { ...lastBlock, content: lastBlock.content + (event.tool_use_input as string) };
+            }
+          } else if (event.tool_result) {
+            const result = event.tool_result as { tool_use_id: string; validation: ToolValidation };
+            // Attach validation to the matching tool_use block
+            const idx = blocks.findIndex(b => b.type === 'tool_use' && b.toolUseId === result.tool_use_id);
+            if (idx !== -1) {
+              blocks[idx] = { ...blocks[idx], validation: result.validation };
             }
           }
           // block_stop: no state change needed — next delta auto-starts a new block
@@ -369,6 +431,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
                               name={block.name || 'tool'}
                               content={block.content}
                               isStreaming={isStreaming && i === messages.length - 1 && idx === msg.blocks!.length - 1}
+                              validation={block.validation}
                             />
                           ) : null
                         )}

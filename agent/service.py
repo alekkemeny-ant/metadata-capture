@@ -1,5 +1,6 @@
 """Core agent service that wraps the Claude Code SDK for metadata capture."""
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from claude_agent_sdk.types import (
 )
 
 from .prompts.system_prompt import SYSTEM_PROMPT
+from .shared import validation_events
 from .tools.capture_mcp import capture_server
 from .tools.metadata_store import (
     get_conversation_history,
@@ -174,8 +176,26 @@ async def chat(session_id: str, user_message: str, model: str | None = None) -> 
     # AssistantMessages whose text wasn't streamed (e.g. post-tool turns).
     streamed_len_before_msg = 0
 
+    # Set up a validation queue so the capture_metadata tool can push
+    # validation results back to us for streaming to the frontend.
+    queue: asyncio.Queue = asyncio.Queue()
+    token = validation_events.set(queue)
+    last_capture_tool_use_id: str | None = None
+
     try:
         async for message in query(prompt=_create_message_stream(prompt), options=options):
+            # Drain any pending validation results pushed by tool handlers.
+            # These arrive after the tool executes (between the tool_use
+            # AssistantMessage and the next text response).
+            while not queue.empty():
+                validation_dict = queue.get_nowait()
+                if last_capture_tool_use_id:
+                    yield {"tool_result": {
+                        "tool_use_id": last_capture_tool_use_id,
+                        "validation": validation_dict,
+                    }}
+                    last_capture_tool_use_id = None
+
             if isinstance(message, StreamEvent):
                 event = message.event
                 event_type = event.get("type")
@@ -186,7 +206,11 @@ async def chat(session_id: str, user_message: str, model: str | None = None) -> 
                     if block_type == "thinking":
                         yield {"thinking_start": True}
                     elif block_type == "tool_use":
-                        yield {"tool_use_start": {"name": block.get("name", ""), "id": block.get("id", "")}}
+                        tool_name = block.get("name", "")
+                        tool_id = block.get("id", "")
+                        if "capture_metadata" in tool_name:
+                            last_capture_tool_use_id = tool_id
+                        yield {"tool_use_start": {"name": tool_name, "id": tool_id}}
 
                 elif event_type == "content_block_delta":
                     delta = event.get("delta", {})
@@ -238,6 +262,8 @@ async def chat(session_id: str, user_message: str, model: str | None = None) -> 
         error_msg = "I encountered an error processing your request. Please try again."
         full_response.append(error_msg)
         yield {"content": error_msg}
+    finally:
+        validation_events.reset(token)
 
     # Save the assistant's complete response
     assistant_text = "".join(full_response)

@@ -12,6 +12,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from ..shared import validation_events
 from .metadata_store import (
     create_record,
     find_records as store_find_records,
@@ -85,6 +86,14 @@ async def capture_metadata_handler(args: dict[str, Any]) -> dict[str, Any]:
         validation_result = validate_record(record_type, record_data)
         await update_record_validation(record_id, validation_result.to_dict())
 
+        validation_dict = validation_result.to_dict()
+
+        # Push validation to the streaming queue so the frontend can
+        # display errors/warnings inline in the tool dropdown.
+        queue = validation_events.get(None)
+        if queue is not None:
+            queue.put_nowait(validation_dict)
+
         return _success({
             "action": action,
             "record_id": record_id,
@@ -92,6 +101,7 @@ async def capture_metadata_handler(args: dict[str, Any]) -> dict[str, Any]:
             "category": CATEGORY_MAP[record_type],
             "name": record.get("name"),
             "message": f"Successfully {action} {record_type} record",
+            "validation": validation_dict,
         })
 
     except Exception as e:

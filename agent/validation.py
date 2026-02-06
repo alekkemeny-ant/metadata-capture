@@ -2,8 +2,9 @@
 
 Validates extracted metadata against AIND schema rules on a per-record-type basis:
 - Required field checks
-- Enum validation (modality, sex, species)
+- Enum validation (modality, sex, species) — derived from aind-data-schema Pydantic models
 - Format validation (subject IDs, timestamps, coordinates)
+- Unknown field warnings (fields not in the canonical schema)
 """
 
 from __future__ import annotations
@@ -12,36 +13,30 @@ import re
 from datetime import datetime
 from typing import Any
 
+from agent.schema_info import (
+    SCHEMA_AVAILABLE,
+    KNOWN_FIELDS,
+    VALID_MODALITIES as _SCHEMA_MODALITIES,
+    VALID_SPECIES as _SCHEMA_SPECIES,
+    VALID_SEX as _SCHEMA_SEX,
+)
+
 # ---------------------------------------------------------------------------
-# Controlled vocabularies from AIND schema
+# Controlled vocabularies — derived from aind-data-schema when available,
+# with inline fallbacks if the package is not installed.
 # ---------------------------------------------------------------------------
 
-VALID_MODALITIES = frozenset({
-    "behavior",
-    "behavior-videos",
-    "confocal",
-    "EMG",
-    "ecephys",
-    "fib",
-    "fMOST",
-    "icephys",
-    "ISI",
-    "MRI",
-    "merfish",
-    "pophys",
-    "slap",
-    "SPIM",
+VALID_MODALITIES: frozenset[str] = _SCHEMA_MODALITIES or frozenset({
+    "behavior", "behavior-videos", "confocal", "EMG", "ecephys", "fib",
+    "fMOST", "icephys", "ISI", "MRI", "merfish", "pophys", "slap2", "SPIM",
+    "BARseq", "EM", "MAPseq", "STPT", "brightfield", "scRNAseq",
 })
 
-VALID_SEX = frozenset({"Male", "Female", "Unknown"})
+VALID_SEX: frozenset[str] = _SCHEMA_SEX or frozenset({"Male", "Female"})
 
-VALID_SPECIES = frozenset({
-    "Mus musculus",
-    "Homo sapiens",
-    "Rattus norvegicus",
-    "Macaca mulatta",
-    "Drosophila melanogaster",
-    "Danio rerio",
+VALID_SPECIES: frozenset[str] = _SCHEMA_SPECIES or frozenset({
+    "Mus musculus", "Homo sapiens", "Rattus norvegicus",
+    "Macaca mulatta", "Callithrix jacchus",
 })
 
 # Required fields per record type (dot paths within the record's data_json)
@@ -150,6 +145,19 @@ def _check_required_fields(record_type: str, data: dict, result: ValidationResul
             result.missing_required.append(field_path)
         else:
             result.add_valid(field_path)
+
+
+def _check_unknown_fields(record_type: str, data: dict, result: ValidationResult) -> None:
+    """Warn about fields not recognized in the aind-data-schema for this record type."""
+    known = KNOWN_FIELDS.get(record_type)
+    if known is None:
+        return
+    for field_name in data:
+        if field_name not in known:
+            result.add_warning(
+                field_name,
+                f"Unknown field '{field_name}' is not in the aind-data-schema for {record_type}",
+            )
 
 
 def _validate_subject(data: dict, result: ValidationResult) -> None:
@@ -320,6 +328,9 @@ def validate_record(record_type: str, data: dict[str, Any]) -> ValidationResult:
     """
     result = ValidationResult(record_type)
     _check_required_fields(record_type, data, result)
+
+    if SCHEMA_AVAILABLE:
+        _check_unknown_fields(record_type, data, result)
 
     validator = _VALIDATORS.get(record_type)
     if validator:

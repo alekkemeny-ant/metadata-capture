@@ -10,6 +10,8 @@ A real-time metadata capture and validation platform for the Allen Institute for
 - **Shared vs asset-specific** — Subjects, instruments, procedures, and rigs are reusable across experiments; sessions, acquisitions, and data descriptions are tied to specific data assets
 - **Cross-session linking** — Shared records created in one chat can be found and linked from another chat
 - **Token-by-token streaming** — Real-time SSE streaming with stop button, tool progress indicators with elapsed timers, and model selector (Opus/Sonnet/Haiku)
+- **Schema-backed validation** — Enum sets (modalities, species, sex) derived from `aind-data-schema` Pydantic models at import time, so they never drift from the canonical schema. Unknown fields trigger warnings.
+- **Inline validation display** — Validation errors and warnings appear directly in the chat tool dropdowns with colored badges (red for errors, amber for warnings), auto-expanded when issues are found
 - **Live database validation** — Validates project names, subject IDs, and modalities against AIND's live MongoDB via MCP
 - **Registry validation** — Cross-references Addgene, NCBI GenBank, and MGI databases
 - **Session persistence** — Conversations survive page reloads; a sidebar lets you switch between chats
@@ -125,7 +127,7 @@ python3 -m pytest evals/tasks/validation/ -v -m network
 - [x] Agent core (Claude Agent SDK + FastAPI + model selector)
 - [x] Granular metadata records (per-type records with shared/asset categories)
 - [x] Record linking (explicit many-to-many links, cross-session reuse)
-- [x] Validation (per-record-type schema validation, Addgene/NCBI/MGI registries, live AIND MongoDB via MCP)
+- [x] Validation (schema-derived enums via `aind-data-schema`, unknown-field warnings, inline chat display, Addgene/NCBI/MGI registries, live AIND MongoDB via MCP)
 - [x] Context-aware tool-based extraction (3 MCP tools: capture, find, link)
 - [x] Chat interface (token streaming, tool progress indicators with elapsed timers, model selector)
 - [x] Dashboard (session view + library view, inline editing, schema placeholders)
@@ -133,7 +135,7 @@ python3 -m pytest evals/tasks/validation/ -v -m network
 - [x] Eval suite (53 deterministic tests + LLM-graded + network tests)
 - [ ] Auto-trigger registry lookups when relevant fields are extracted
 - [ ] Validation feedback loop into agent conversation for proactive prompting
-- [ ] Deeper schema validation via `aind-data-schema` Pydantic models
+- [x] Deeper schema validation via `aind-data-schema` Pydantic models
 - [ ] Multi-modal input (audio recordings, images of lab notebooks, documents)
 - [ ] MCP write access to AIND MongoDB
 - [ ] Cloud deployment
