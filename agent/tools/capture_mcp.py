@@ -28,6 +28,49 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _format_validation_summary(validation: dict[str, Any]) -> str:
+    """Format validation results as clear text for the agent to relay to the user."""
+    status = validation.get("status", "valid")
+    errors = validation.get("errors", [])
+    warnings = validation.get("warnings", [])
+    missing = validation.get("missing_required", [])
+
+    if status == "valid" and not missing:
+        return "VALIDATION PASSED: All fields are valid."
+
+    lines: list[str] = []
+
+    if errors:
+        lines.append("VALIDATION ERRORS (must be fixed):")
+        for e in errors:
+            lines.append(f"  - {e['field']}: {e['message']}")
+
+    if missing:
+        lines.append(f"MISSING REQUIRED FIELDS: {', '.join(missing)}")
+
+    if warnings:
+        lines.append("WARNINGS:")
+        for w in warnings:
+            lines.append(f"  - {w['field']}: {w['message']}")
+
+    lines.append("")
+    lines.append("You MUST report these issues to the user and suggest how to fix them.")
+
+    return "\n".join(lines)
+
+
+def _success(data: dict[str, Any]) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": json.dumps(data)}]}
+
+
+def _error(message: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": json.dumps({"status": "error", "error": message})}]}
+
+
+# ---------------------------------------------------------------------------
 # capture_metadata tool
 # ---------------------------------------------------------------------------
 
@@ -94,6 +137,10 @@ async def capture_metadata_handler(args: dict[str, Any]) -> dict[str, Any]:
         if queue is not None:
             queue.put_nowait(validation_dict)
 
+        # Build a human-readable validation summary so the agent
+        # reliably flags issues to the user in its response.
+        validation_summary = _format_validation_summary(validation_dict)
+
         return _success({
             "action": action,
             "record_id": record_id,
@@ -102,6 +149,7 @@ async def capture_metadata_handler(args: dict[str, Any]) -> dict[str, Any]:
             "name": record.get("name"),
             "message": f"Successfully {action} {record_type} record",
             "validation": validation_dict,
+            "validation_summary": validation_summary,
         })
 
     except Exception as e:
@@ -259,18 +307,6 @@ Example: link_records(source_id="<session_record_id>", target_id="<subject_recor
 async def link_records_tool(args: dict[str, Any]) -> dict[str, Any]:
     """MCP tool wrapper for link_records_handler."""
     return await link_records_handler(args)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _success(data: dict[str, Any]) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(data)}]}
-
-
-def _error(message: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps({"status": "error", "error": message})}]}
 
 
 # ---------------------------------------------------------------------------

@@ -117,6 +117,22 @@ link it to the relevant shared records using the link_to parameter.
 7. **Follow-up naturally**: Only ask follow-up questions about the record type the user is \
 currently discussing. Don't jump to unrelated metadata sections.
 
+## Validation Feedback
+
+After every capture_metadata call, check the `validation_summary` field in the tool result. \
+If there are validation errors or warnings:
+
+1. **Always tell the user** about validation issues — never silently ignore them.
+2. **Explain the problem clearly**: e.g., "'Unknown' is not a valid sex — the AIND schema \
+only allows 'Male' or 'Female'."
+3. **Suggest a fix**: e.g., "Would you like to update the sex to Male or Female?"
+4. **For errors**: Offer to update the record with a corrected value using capture_metadata \
+with the record_id.
+5. **For warnings about unknown fields**: Mention the field name may not match the AIND schema \
+and ask if the user intended a different field name.
+
+If validation passes with no issues, you do not need to mention it.
+
 ## Important Rules
 
 - Never fabricate metadata values. If unsure, ask the user.

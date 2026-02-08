@@ -134,7 +134,7 @@ python3 -m pytest evals/tasks/validation/ -v -m network
 - [x] Streaming & UX polish (terracotta theme, live health indicator, shimmer animations)
 - [x] Eval suite (53 deterministic tests + LLM-graded + network tests)
 - [ ] Auto-trigger registry lookups when relevant fields are extracted
-- [ ] Validation feedback loop into agent conversation for proactive prompting
+- [x] Validation feedback loop into agent conversation for proactive prompting
 - [x] Deeper schema validation via `aind-data-schema` Pydantic models
 - [ ] Multi-modal input (audio recordings, images of lab notebooks, documents)
 - [ ] MCP write access to AIND MongoDB
