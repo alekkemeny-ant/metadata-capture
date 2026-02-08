@@ -113,29 +113,18 @@ def _extract_registry_queries(record_type: str, data: dict[str, Any]) -> dict[st
                     queries.setdefault("mgi", []).append(name)
 
     elif record_type == "procedures":
-        # Injection materials → Addgene
-        # Look for plasmid-like names in injection_materials
-        injection_materials = data.get("injection_materials")
-        if injection_materials:
-            mat_str = json.dumps(injection_materials, default=str)
-            for match in _PLASMID_PATTERN.findall(mat_str):
+        # Serialize the entire procedures data to catch plasmid names
+        # regardless of nesting (e.g., inside subject_procedures[].injection_materials[])
+        full_str = json.dumps(data, default=str)
+
+        # Plasmid / vector names → Addgene
+        for match in _PLASMID_PATTERN.findall(full_str):
+            queries.setdefault("addgene", []).append(match)
+
+        # Addgene catalog numbers (4-6 digit numbers)
+        for match in _ADDGENE_CATALOG_PATTERN.findall(full_str):
+            if int(match) > 1000:
                 queries.setdefault("addgene", []).append(match)
-            for match in _ADDGENE_CATALOG_PATTERN.findall(mat_str):
-                if int(match) > 1000:  # filter out small numbers
-                    queries.setdefault("addgene", []).append(match)
-
-        # Virus names / constructs
-        for field in ["viral_construct", "virus_name", "construct"]:
-            val = data.get(field)
-            if val and isinstance(val, str) and len(val) > 3:
-                queries.setdefault("addgene", []).append(val)
-
-        # Protocol IDs that look like Addgene catalog numbers
-        protocol_id = data.get("protocol_id")
-        if protocol_id and isinstance(protocol_id, str):
-            for match in _ADDGENE_CATALOG_PATTERN.findall(protocol_id):
-                if int(match) > 1000:
-                    queries.setdefault("addgene", []).append(match)
 
     # Deduplicate
     for key in queries:
