@@ -18,6 +18,7 @@ KNOWN_FIELDS: dict[str, frozenset[str]] = {}
 VALID_MODALITIES: frozenset[str] = frozenset()
 VALID_SPECIES: frozenset[str] = frozenset()
 VALID_SEX: frozenset[str] = frozenset()
+SPECIES_REGISTRY: dict[str, dict[str, str]] = {}
 
 # Meta fields to exclude from KNOWN_FIELDS
 _META_FIELDS = {"object_type", "describedBy", "schema_version"}
@@ -106,6 +107,21 @@ try:
         s.model_fields["name"].default for s in Species.ALL
     )
     VALID_SEX = frozenset(s.value for s in Sex)
+
+    # Species → NCBI taxonomy registry mapping
+    # Maps species name to full schema-compliant species object with registry info.
+    SPECIES_REGISTRY = {}
+    for _sp in Species.ALL:
+        _fields = {k: v.default for k, v in _sp.model_fields.items()}
+        _name = _fields.get("name", "")
+        _registry = _fields.get("registry")
+        _reg_id = _fields.get("registry_identifier", "")
+        if _name and _reg_id:
+            SPECIES_REGISTRY[_name] = {
+                "name": _name,
+                "registry": _registry.value if hasattr(_registry, "value") else str(_registry),
+                "registry_identifier": _reg_id,
+            }
 
     SCHEMA_AVAILABLE = True
 

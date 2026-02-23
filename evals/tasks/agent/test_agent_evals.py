@@ -431,3 +431,44 @@ def test_unknown_fields_warned(client):
             "unknown fields?"
         ),
     })
+
+
+# ===========================================================================
+# Species NCBI taxonomy enrichment tests
+# ===========================================================================
+
+
+@pytest.mark.llm
+@pytest.mark.network
+def test_species_ncbi_enrichment(client):
+    """Subject record should include NCBI taxonomy ID for known species."""
+    prompt = "I have a new mouse, subject ID 334455"
+    response = _run(_send_chat(client, prompt))
+
+    # Deterministic: subject record should exist with species + NCBI taxonomy ID
+    records = _run(_get_records(client, record_type="subject"))
+    assert len(records) >= 1, f"Expected at least 1 subject record, got {len(records)}"
+    subject = records[0]
+    data = subject.get("data_json") or {}
+    if isinstance(data, str):
+        data = json.loads(data)
+    assert data.get("subject_id") == "334455", f"Subject ID mismatch: {data}"
+
+    species = data.get("species")
+    assert isinstance(species, dict), f"Species should be a dict, got: {species}"
+    assert species.get("name") == "Mus musculus", f"Species name mismatch: {species}"
+    assert species.get("registry_identifier") == "NCBI:txid10090", (
+        f"Missing or wrong NCBI taxonomy ID. Species data: {species}"
+    )
+
+    # LLM: agent should mention the species with its taxonomy info
+    _grade(response, prompt, {
+        "species_identification": (
+            "Did the agent correctly identify the species as Mus musculus for a mouse?"
+        ),
+        "ncbi_taxonomy": (
+            "Did the agent mention or include the NCBI taxonomy identifier "
+            "(NCBI:txid10090) for Mus musculus? The species record should include "
+            "the NCBI registry information."
+        ),
+    })

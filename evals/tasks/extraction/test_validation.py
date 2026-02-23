@@ -2,7 +2,7 @@
 
 import pytest
 
-from agent.schema_info import SCHEMA_AVAILABLE, SCHEMA_MODELS, KNOWN_FIELDS, VALID_MODALITIES as SCHEMA_MODALITIES, VALID_SPECIES as SCHEMA_SPECIES, VALID_SEX as SCHEMA_SEX
+from agent.schema_info import SCHEMA_AVAILABLE, SCHEMA_MODELS, KNOWN_FIELDS, VALID_MODALITIES as SCHEMA_MODALITIES, VALID_SPECIES as SCHEMA_SPECIES, VALID_SEX as SCHEMA_SEX, SPECIES_REGISTRY
 from agent.validation import validate_record, validate_metadata, VALID_SEX, VALID_MODALITIES
 from agent.tools.capture_mcp import _format_validation_summary, _extract_registry_queries, _format_registry_summary
 
@@ -210,6 +210,82 @@ class TestSchemaIntegration:
         expected = {"subject", "procedures", "data_description", "instrument",
                     "acquisition", "processing", "quality_control", "session", "rig"}
         assert set(SCHEMA_MODELS.keys()) == expected
+
+    def test_species_registry_has_mus_musculus(self):
+        """SPECIES_REGISTRY should contain Mus musculus with NCBI taxonomy ID."""
+        assert "Mus musculus" in SPECIES_REGISTRY
+        entry = SPECIES_REGISTRY["Mus musculus"]
+        assert entry["registry_identifier"] == "NCBI:txid10090"
+        assert "NCBI" in entry["registry"]
+
+    def test_species_registry_has_homo_sapiens(self):
+        """SPECIES_REGISTRY should contain Homo sapiens with NCBI taxonomy ID."""
+        assert "Homo sapiens" in SPECIES_REGISTRY
+        entry = SPECIES_REGISTRY["Homo sapiens"]
+        assert entry["registry_identifier"] == "NCBI:txid9606"
+
+    def test_species_registry_all_have_ncbi_ids(self):
+        """Every entry in SPECIES_REGISTRY should have a registry_identifier."""
+        for name, entry in SPECIES_REGISTRY.items():
+            assert "registry_identifier" in entry, f"Missing registry_identifier for '{name}'"
+            assert entry["registry_identifier"].startswith("NCBI:txid"), (
+                f"'{name}' has unexpected registry_identifier: {entry['registry_identifier']}"
+            )
+
+
+class TestSpeciesAutoEnrichment:
+    """Test that species data gets auto-enriched with NCBI taxonomy IDs."""
+
+    def test_enrich_mus_musculus(self):
+        """Species 'Mus musculus' should be enriched with NCBI:txid10090."""
+        data = {"subject_id": "12345", "species": {"name": "Mus musculus"}}
+        species = data["species"]
+        sp_name = species.get("name")
+        if sp_name and sp_name in SPECIES_REGISTRY and "registry_identifier" not in species:
+            species.update(SPECIES_REGISTRY[sp_name])
+        assert species["registry_identifier"] == "NCBI:txid10090"
+        assert "NCBI" in species["registry"]
+        assert species["name"] == "Mus musculus"
+
+    def test_enrich_homo_sapiens(self):
+        """Species 'Homo sapiens' should be enriched with NCBI:txid9606."""
+        data = {"subject_id": "12345", "species": {"name": "Homo sapiens"}}
+        species = data["species"]
+        sp_name = species.get("name")
+        if sp_name and sp_name in SPECIES_REGISTRY and "registry_identifier" not in species:
+            species.update(SPECIES_REGISTRY[sp_name])
+        assert species["registry_identifier"] == "NCBI:txid9606"
+
+    def test_no_overwrite_existing_registry(self):
+        """If registry_identifier is already set, enrichment should not overwrite it."""
+        data = {"subject_id": "12345", "species": {
+            "name": "Mus musculus",
+            "registry_identifier": "custom:123",
+        }}
+        species = data["species"]
+        sp_name = species.get("name")
+        if sp_name and sp_name in SPECIES_REGISTRY and "registry_identifier" not in species:
+            species.update(SPECIES_REGISTRY[sp_name])
+        assert species["registry_identifier"] == "custom:123"
+
+    def test_unknown_species_not_enriched(self):
+        """Unknown species should not gain registry fields."""
+        data = {"subject_id": "12345", "species": {"name": "Canis lupus"}}
+        species = data["species"]
+        sp_name = species.get("name")
+        if sp_name and sp_name in SPECIES_REGISTRY and "registry_identifier" not in species:
+            species.update(SPECIES_REGISTRY[sp_name])
+        assert "registry_identifier" not in species
+
+    def test_species_string_not_enriched(self):
+        """Species stored as a plain string (not dict) should be left alone."""
+        data = {"subject_id": "12345", "species": "Mus musculus"}
+        species = data.get("species")
+        if isinstance(species, dict):
+            sp_name = species.get("name")
+            if sp_name and sp_name in SPECIES_REGISTRY and "registry_identifier" not in species:
+                species.update(SPECIES_REGISTRY[sp_name])
+        assert data["species"] == "Mus musculus"
 
 
 class TestUnknownFields:

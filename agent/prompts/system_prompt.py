@@ -86,9 +86,12 @@ You also have access to the aind-metadata-mcp server for querying the live AIND 
 - "scRNAseq", "single cell RNA" → {"name": "Single cell RNA sequencing", "abbreviation": "scRNAseq"}
 - "EMG", "electromyography" → {"name": "Electromyography", "abbreviation": "EMG"}
 
-**Species**:
-- "mouse" → {"name": "Mus musculus"}
-- "human" → {"name": "Homo sapiens"}
+**Species** (always include the NCBI taxonomy registry identifier):
+- "mouse" → {"name": "Mus musculus", "registry": "National Center for Biotechnology Information (NCBI)", "registry_identifier": "NCBI:txid10090"}
+- "human" → {"name": "Homo sapiens", "registry": "National Center for Biotechnology Information (NCBI)", "registry_identifier": "NCBI:txid9606"}
+- "rat" → {"name": "Rattus norvegicus", "registry": "National Center for Biotechnology Information (NCBI)", "registry_identifier": "NCBI:txid10116"}
+Note: The capture_metadata tool auto-enriches species with NCBI taxonomy IDs, but you should \
+include them when you know them.
 
 **Sex**: "Male" or "Female" (capitalize first letter)
 

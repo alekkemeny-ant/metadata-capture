@@ -25,6 +25,7 @@ from .metadata_store import (
     update_record_validation,
 )
 from ..db.models import CATEGORY_MAP, VALID_RECORD_TYPES
+from ..schema_info import SPECIES_REGISTRY
 from ..validation import validate_record
 
 logger = logging.getLogger(__name__)
@@ -239,6 +240,15 @@ async def capture_metadata_handler(args: dict[str, Any]) -> dict[str, Any]:
         else:
             return _error("data is required and must be a JSON object")
 
+    # Auto-enrich species with NCBI taxonomy registry info from the schema
+    if record_type == "subject":
+        species = data.get("species")
+        if isinstance(species, dict):
+            sp_name = species.get("name")
+            if sp_name and sp_name in SPECIES_REGISTRY and "registry_identifier" not in species:
+                species.update(SPECIES_REGISTRY[sp_name])
+                logger.info("Enriched species '%s' with registry info: %s", sp_name, SPECIES_REGISTRY[sp_name].get("registry_identifier"))
+
     record_id = args.get("record_id")
     name = args.get("name")
     link_to = args.get("link_to")
@@ -327,7 +337,7 @@ To update an existing record, pass its record_id. To link a new record to an exi
 (e.g., link a session to a subject), pass the link_to parameter with the target record's ID.
 
 Example calls:
-    capture_metadata(session_id="abc", record_type="subject", data={"subject_id": "4528", "species": {"name": "Mus musculus"}})
+    capture_metadata(session_id="abc", record_type="subject", data={"subject_id": "4528", "species": {"name": "Mus musculus", "registry": "National Center for Biotechnology Information (NCBI)", "registry_identifier": "NCBI:txid10090"}})
     capture_metadata(session_id="abc", record_type="procedures", data={"procedure_type": "Injection", "coordinates": {"x": -1.5, "y": 2.0, "z": -3.5}})
     capture_metadata(session_id="abc", record_type="session", data={"session_start_time": "2025-01-15T09:00:00"}, link_to="<subject_record_id>")
 """,
