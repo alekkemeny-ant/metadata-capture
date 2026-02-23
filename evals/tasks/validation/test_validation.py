@@ -48,7 +48,7 @@ def test_registry_lookup(case: dict[str, Any]) -> None:
     expected = case["expected"]
 
     fn = REGISTRY_FN[registry]
-    result = asyncio.get_event_loop().run_until_complete(fn(query))
+    result = asyncio.run(fn(query))
 
     # Must not have an error
     assert "error" not in result, f"Lookup returned error: {result['error']}"
@@ -78,4 +78,12 @@ def test_registry_lookup(case: dict[str, Any]) -> None:
                 assert fr_spec["symbol_contains"].lower() in first.get("symbol", "").lower(), (
                     f"First result symbol '{first.get('symbol')}' does not contain "
                     f"'{fr_spec['symbol_contains']}'"
+                )
+            if fr_spec.get("has_catalog_number"):
+                assert first.get("catalog_number"), (
+                    f"First result missing catalog_number: {first}"
+                )
+            if fr_spec.get("has_name"):
+                assert first.get("name"), (
+                    f"First result missing name: {first}"
                 )

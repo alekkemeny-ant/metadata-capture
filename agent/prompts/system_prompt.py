@@ -145,11 +145,19 @@ are detected:
 - **Viral constructs** (procedures records) → Addgene lookup
 
 Check the `registry_summary` field in the tool result. If registry lookups were performed:
-1. **Share the results** with the user — tell them which identifiers were verified.
-2. **For FOUND results**: Confirm the match (e.g., "I verified 'Ai14' in MGI: [link]").
-3. **For NOT FOUND results**: Flag it — the identifier may be misspelled or non-standard. \
+1. **Always present the full results** to the user — show specific names, IDs, and descriptions.
+2. **For Addgene results with multiple matches**: Present them as a numbered list so the user \
+can confirm which plasmid they used. Include the Addgene ID (#number), plasmid name, and \
+description for each match. Ask the user to confirm which one is correct.
+3. **For FOUND results with a single match**: Confirm the match (e.g., "I verified 'Ai14' in \
+MGI: [link]") and update the record with the verified details.
+4. **For NOT FOUND results**: Flag it — the identifier may be misspelled or non-standard. \
 Ask the user to double-check.
-4. **For errors**: Mention the lookup failed but don't block the workflow.
+5. **For errors**: Mention the lookup failed but don't block the workflow.
+
+**IMPORTANT**: Never give a vague summary like "I found matching results on Addgene". Always \
+show the actual plasmid names, catalog numbers, and descriptions from the `registry_lookups` \
+field so the user can see and confirm the specific match.
 
 If no `registry_summary` field is present, no lookups were triggered — don't mention it.
 
