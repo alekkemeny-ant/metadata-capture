@@ -439,3 +439,141 @@ class TestRegistrySummaryFormatter:
         summary = _format_registry_summary(results)
         assert "Slc17a7" in summary
         assert "vesicular glutamate" in summary
+
+    def test_addgene_result_with_plasmid_details(self):
+        """Addgene results with structured plasmid data should show names and IDs."""
+        results = [{
+            "registry": "addgene",
+            "query": "AAV11",
+            "found": True,
+            "results": [
+                {"catalog_number": "240486", "name": "pAAV2/11", "description": "AAV packaging plasmid expressing AAV2 Rep and AAV11 capsid", "url": "https://www.addgene.org/240486/"},
+                {"catalog_number": "50465", "name": "pAAV-hSyn-EGFP", "description": "EGFP under human synapsin promoter", "url": "https://www.addgene.org/50465/"},
+            ],
+        }]
+        summary = _format_registry_summary(results)
+        assert "#240486" in summary
+        assert "pAAV2/11" in summary
+        assert "#50465" in summary
+        assert "pAAV-hSyn-EGFP" in summary
+        assert "AAV packaging plasmid" in summary
+
+    def test_addgene_empty_results(self):
+        """Addgene results with no matches should show NOT FOUND."""
+        results = [{
+            "registry": "addgene",
+            "query": "xyznonexistent",
+            "found": False,
+            "results": [],
+        }]
+        summary = _format_registry_summary(results)
+        assert "NOT FOUND" in summary
+
+
+class TestParseAddgeneResults:
+    """Tests for parsing Addgene search page content."""
+
+    def setup_method(self):
+        from agent.tools.registry_lookup import _parse_addgene_results
+        self.parse = _parse_addgene_results
+
+    def test_parse_markdown_links(self):
+        """Should extract plasmid entries from markdown-style links."""
+        text = """
+Showing: 1 - 3 of 3 results
+
+1. [pAAV2/11](/240486/)
+
+    #240486
+
+    Purpose
+
+    AAV packaging plasmid expressing AAV2 Rep and AAV11 capsid
+
+2. [pAAV-hSyn-EGFP](/50465/)
+
+    #50465
+
+    Purpose
+
+    EGFP under human synapsin promoter
+
+3. [pAAV-CAG-GFP](/37825/)
+
+    #37825
+
+    Purpose
+
+    GFP under CAG promoter
+"""
+        results = self.parse(text)
+        assert len(results) == 3
+        assert results[0]["catalog_number"] == "240486"
+        assert results[0]["name"] == "pAAV2/11"
+        assert results[1]["catalog_number"] == "50465"
+        assert results[1]["name"] == "pAAV-hSyn-EGFP"
+        assert results[2]["catalog_number"] == "37825"
+
+    def test_parse_descriptions(self):
+        """Should extract purpose/description text for each plasmid."""
+        text = """
+[pAAV2/11](/240486/)
+
+#240486
+
+Purpose
+
+AAV packaging plasmid expressing AAV2 Rep and AAV11 capsid
+"""
+        results = self.parse(text)
+        assert len(results) == 1
+        assert "AAV packaging plasmid" in results[0]["description"]
+
+    def test_parse_empty_page(self):
+        """No results page should return empty list."""
+        text = "No results found for your query."
+        results = self.parse(text)
+        assert results == []
+
+    def test_parse_generates_urls(self):
+        """Each result should have a full Addgene URL."""
+        text = "[pAAV-hSyn-EGFP](/50465/)"
+        results = self.parse(text)
+        assert len(results) == 1
+        assert results[0]["url"] == "https://www.addgene.org/50465/"
+
+    def test_max_results_limit(self):
+        """Should respect the max_results parameter."""
+        entries = "\n".join(f"[plasmid{i}](/{10000+i}/)" for i in range(10))
+        results = self.parse(entries, max_results=3)
+        assert len(results) == 3
+
+    def test_deduplicates_by_catalog_number(self):
+        """Same catalog number appearing twice should only produce one result."""
+        text = "[pAAV2/11](/240486/)\n[pAAV2/11](/240486/)"
+        results = self.parse(text)
+        assert len(results) == 1
+
+
+class TestExtractRegistryQueriesAAV:
+    """Tests for extracting Addgene queries from AAV serotype names."""
+
+    def test_bare_serotype_aav11(self):
+        """AAV11 (bare serotype) should trigger an Addgene lookup."""
+        data = {"subject_procedures": [{"injection_materials": [{"name": "AAV11"}]}]}
+        queries = _extract_registry_queries("procedures", data)
+        assert "addgene" in queries
+        assert any("AAV11" in q for q in queries["addgene"])
+
+    def test_plasmid_name_paav_hsyn(self):
+        """pAAV-hSyn-EGFP should trigger an Addgene lookup."""
+        data = {"injection_materials": [{"name": "pAAV-hSyn-EGFP"}]}
+        queries = _extract_registry_queries("procedures", data)
+        assert "addgene" in queries
+        assert any("pAAV-hSyn-EGFP" in q for q in queries["addgene"])
+
+    def test_aav_with_capsid_suffix(self):
+        """AAV9 and similar should trigger lookup."""
+        data = {"injection_materials": [{"name": "AAV9"}]}
+        queries = _extract_registry_queries("procedures", data)
+        assert "addgene" in queries

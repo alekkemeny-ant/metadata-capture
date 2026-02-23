@@ -1,10 +1,77 @@
 """External registry validation tools for looking up biological entities."""
 
+import re
 from typing import Any
 
 import httpx
 
 _TIMEOUT = 15.0
+
+# ---------------------------------------------------------------------------
+# Addgene HTML parsing
+# ---------------------------------------------------------------------------
+
+# Markdown-based patterns (httpx returns HTML that we scan for result links)
+# Matches links to individual plasmid pages: [plasmid_name](/12345/)
+_MD_RESULT_RE = re.compile(
+    r'\[([^\]]+)\]\(/(\d{4,6})/?\)',
+)
+# Matches catalog number followed (possibly across newlines) by Purpose/Description
+_MD_PURPOSE_RE = re.compile(
+    r'#(\d{4,6})[\s\S]*?(?:Purpose|Description)\s*\n\s*([^\n]{5,200})',
+    re.IGNORECASE,
+)
+# HTML link pattern: <a href="/12345/">plasmid_name</a>
+_HTML_LINK_RE = re.compile(
+    r'<a[^>]+href="(/(\d{4,6})/?)"[^>]*>\s*([^<]+?)\s*</a>',
+)
+# HTML purpose pattern
+_HTML_PURPOSE_RE = re.compile(
+    r'>\s*#(\d{4,6})\s*<.*?(?:Purpose|purpose).*?>\s*([^<]{5,200})',
+    re.DOTALL,
+)
+
+
+def _parse_addgene_results(text: str, max_results: int = 5) -> list[dict[str, Any]]:
+    """Extract plasmid entries from Addgene search page content (HTML or markdown).
+
+    Returns a list of dicts with keys: catalog_number, name, description, url.
+    """
+    results: dict[str, dict[str, Any]] = {}  # keyed by catalog_number to dedupe
+
+    # Try markdown-style links first (e.g. [pAAV2/11](/240486/))
+    for match in _MD_RESULT_RE.finditer(text):
+        name, catalog = match.group(1).strip(), match.group(2)
+        if catalog not in results:
+            results[catalog] = {
+                "catalog_number": catalog,
+                "name": name,
+                "description": "",
+                "url": f"https://www.addgene.org/{catalog}/",
+            }
+
+    # Try HTML-style links as fallback
+    if not results:
+        for match in _HTML_LINK_RE.finditer(text):
+            _, catalog, name = match.group(1), match.group(2), match.group(3).strip()
+            if catalog not in results and name and not name.startswith("#"):
+                results[catalog] = {
+                    "catalog_number": catalog,
+                    "name": name,
+                    "description": "",
+                    "url": f"https://www.addgene.org/{catalog}/",
+                }
+
+    # Fill in descriptions from purpose fields
+    for pattern in [_MD_PURPOSE_RE, _HTML_PURPOSE_RE]:
+        for match in pattern.finditer(text):
+            catalog = match.group(1)
+            desc = match.group(2).strip()
+            if catalog in results and not results[catalog]["description"]:
+                desc = re.sub(r'<[^>]+>', '', desc).strip()
+                results[catalog]["description"] = desc
+
+    return list(results.values())[:max_results]
 
 
 async def lookup_addgene(query: str) -> dict[str, Any]:
@@ -37,11 +104,23 @@ async def lookup_addgene(query: str) -> dict[str, Any]:
                     }
 
             resp = await client.get(url, params=params)
+
+            # Parse actual search results from the page content
+            plasmids = _parse_addgene_results(resp.text)
+
+            if plasmids:
+                return {
+                    "query": query,
+                    "found": True,
+                    "results": plasmids,
+                    "url": str(resp.url),
+                }
+
             return {
                 "query": query,
-                "status_code": resp.status_code,
+                "found": False,
+                "results": [],
                 "url": str(resp.url),
-                "found": resp.status_code == 200,
             }
     except httpx.HTTPError as exc:
         return {"error": str(exc), "query": query}

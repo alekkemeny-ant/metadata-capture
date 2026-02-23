@@ -17,6 +17,23 @@
   query: "pAAV-EF1a-DIO-hChR2"
   expected:
     found: true
+  expected_fields:
+    results:
+      min_length: 1
+
+- id: addgene_serotype_search
+  description: Search Addgene by AAV serotype — should return matching plasmids with details
+  type: validation
+  registry: addgene
+  query: "AAV11"
+  expected:
+    found: true
+  expected_fields:
+    results:
+      min_length: 1
+      first_result:
+        has_catalog_number: true
+        has_name: true
 
 - id: addgene_nonexistent
   description: Search Addgene for a nonexistent plasmid
@@ -24,7 +41,7 @@
   registry: addgene
   query: "zzz_nonexistent_plasmid_99999999"
   expected:
-    found: true  # Search page returns 200 even for no results
+    found: false
 
 - id: ncbi_gene_symbol
   description: Look up a known gene symbol in NCBI Gene

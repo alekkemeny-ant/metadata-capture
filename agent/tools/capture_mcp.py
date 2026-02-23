@@ -196,12 +196,21 @@ def _format_registry_summary(results: list[dict[str, Any]]) -> str:
         elif found:
             # Include key details
             if r.get("results"):
-                # NCBI gene results
-                for gene in r["results"][:2]:
-                    symbol = gene.get("symbol", "")
-                    desc = gene.get("description", "")
-                    url = gene.get("url", "")
-                    lines.append(f"  - {registry} '{query}': FOUND — {symbol} ({desc}) {url}")
+                for entry in r["results"][:4]:
+                    if entry.get("symbol"):
+                        # NCBI gene results
+                        symbol = entry.get("symbol", "")
+                        desc = entry.get("description", "")
+                        url = entry.get("url", "")
+                        lines.append(f"  - {registry} '{query}': FOUND — {symbol} ({desc}) {url}")
+                    elif entry.get("catalog_number"):
+                        # Addgene plasmid results
+                        cat = entry["catalog_number"]
+                        name = entry.get("name", "")
+                        desc = entry.get("description", "")
+                        url = entry.get("url", f"https://www.addgene.org/{cat}/")
+                        desc_part = f" — {desc}" if desc else ""
+                        lines.append(f"  - {registry} '{query}': FOUND — #{cat} {name}{desc_part} {url}")
             elif r.get("url"):
                 lines.append(f"  - {registry} '{query}': FOUND — {r['url']}")
             else:
