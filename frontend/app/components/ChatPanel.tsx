@@ -3,7 +3,42 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { sendChatMessage, fetchMessages, fetchModels, ChatMessage } from '../lib/api';
+import { sendChatMessage, fetchMessages, fetchModels, uploadFile, getUploadUrl, ChatMessage, MessageAttachment } from '../lib/api';
+
+// ---------------------------------------------------------------------------
+// File attachment types
+// ---------------------------------------------------------------------------
+
+interface FileAttachment {
+  file: File;
+  preview?: string; // object URL for image preview
+}
+
+// SpeechRecognition type shim for browsers that support it
+interface SpeechRecognitionEvent {
+  results: { length: number; [index: number]: { isFinal: boolean; 0: { transcript: string } } };
+}
+
+interface SpeechRecognitionInstance {
+  continuous: boolean;
+  interimResults: boolean;
+  start(): void;
+  stop(): void;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+}
+
+interface SpeechRecognitionConstructor {
+  new (): SpeechRecognitionInstance;
+}
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Block types for structured assistant messages
@@ -33,6 +68,7 @@ interface StructuredMessage {
   role: 'user' | 'assistant';
   content: string;       // plain text (persistence & history fallback)
   blocks?: MessageBlock[]; // structured blocks built during streaming
+  attachments?: MessageAttachment[]; // file attachments (images, PDFs)
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +274,13 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
   const [error, setError] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>('');
+  const [pendingFiles, setPendingFiles] = useState<FileAttachment[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const scrollToBottom = useCallback(() => {
@@ -276,14 +317,168 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
     }
   }, [input]);
 
+  // Cleanup file previews on unmount
+  useEffect(() => {
+    return () => {
+      pendingFiles.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // File attachment helpers
+  // ---------------------------------------------------------------------------
+
+  const addFiles = (files: FileList | File[]) => {
+    const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf'];
+    const newAttachments: FileAttachment[] = [];
+    for (const file of Array.from(files)) {
+      if (!allowed.includes(file.type)) continue;
+      if (file.size > 20 * 1024 * 1024) continue;
+      const preview = file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined;
+      newAttachments.push({ file, preview });
+    }
+    if (newAttachments.length) setPendingFiles((prev) => [...prev, ...newAttachments]);
+  };
+
+  const removeFile = (index: number) => {
+    setPendingFiles((prev) => {
+      const removed = prev[index];
+      if (removed?.preview) URL.revokeObjectURL(removed.preview);
+      return prev.filter((_, i) => i !== index);
+    });
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageFiles: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.type.startsWith('image/') && item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) imageFiles.push(file);
+      }
+    }
+    if (imageFiles.length) {
+      e.preventDefault();
+      addFiles(imageFiles);
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Drag-and-drop
+  // ---------------------------------------------------------------------------
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+  };
+
+  // ---------------------------------------------------------------------------
+  // Speech-to-text (Web Speech API)
+  // ---------------------------------------------------------------------------
+
+  const [speechSupported, setSpeechSupported] = useState(false);
+  useEffect(() => {
+    setSpeechSupported(!!(window.SpeechRecognition || window.webkitSpeechRecognition));
+  }, []);
+
+  const toggleListening = () => {
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const SRConstructor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SRConstructor) return;
+
+    const recognition = new SRConstructor() as SpeechRecognitionInstance;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    let finalTranscript = '';
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      let interim = '';
+      for (let i = 0; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          finalTranscript += result[0].transcript;
+        } else {
+          interim += result[0].transcript;
+        }
+      }
+      setInput((prev) => {
+        const base = prev.replace(/\u200B.*$/, '').trimEnd();
+        const prefix = base ? base + ' ' : '';
+        return prefix + finalTranscript + (interim ? '\u200B' + interim : '');
+      });
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+      recognitionRef.current = null;
+      // Clean up zero-width space markers from interim results
+      setInput((prev) => prev.replace(/\u200B/g, ''));
+    };
+
+    recognition.onerror = () => {
+      setIsListening(false);
+      recognitionRef.current = null;
+    };
+
+    recognitionRef.current = recognition;
+    recognition.start();
+    setIsListening(true);
+  };
+
   const handleSend = async () => {
     const trimmed = input.trim();
-    if (!trimmed || isStreaming) return;
+    if ((!trimmed && pendingFiles.length === 0) || isStreaming) return;
 
     setError(null);
-    const userMsg: ChatMessage = { role: 'user', content: trimmed };
+
+    // Upload pending files first
+    let attachmentRefs: MessageAttachment[] | undefined;
+    const filesToUpload = [...pendingFiles];
+    if (filesToUpload.length > 0) {
+      try {
+        const uploaded = await Promise.all(
+          filesToUpload.map((f) => uploadFile(f.file, sessionId || undefined))
+        );
+        attachmentRefs = uploaded.map((u) => ({
+          file_id: u.id,
+          filename: u.filename,
+          content_type: u.content_type,
+        }));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Upload failed');
+        return;
+      }
+    }
+
+    const userMsg: StructuredMessage = {
+      role: 'user',
+      content: trimmed || '(attached files)',
+      attachments: attachmentRefs,
+    };
     setMessages((prev) => [...prev, userMsg]);
     setInput('');
+    // Clean up previews and clear pending files
+    pendingFiles.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
+    setPendingFiles([]);
     setIsStreaming(true);
 
     // Add empty assistant message to stream into
@@ -293,7 +488,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
     abortControllerRef.current = controller;
 
     await sendChatMessage(
-      trimmed,
+      trimmed || '(attached files)',
       sessionId,
       (event) => {
         setMessages((prev) => {
@@ -370,6 +565,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
       },
       controller.signal,
       selectedModel || undefined,
+      attachmentRefs,
     );
   };
 
@@ -381,7 +577,18 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
   };
 
   return (
-    <div className="flex flex-col h-full">
+    <div
+      className="flex flex-col h-full relative"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {/* Drag overlay */}
+      {isDragging && (
+        <div className="absolute inset-0 z-50 bg-brand-fig/10 border-2 border-dashed border-brand-fig rounded-xl flex items-center justify-center pointer-events-none">
+          <div className="text-brand-fig font-medium text-lg">Drop files here</div>
+        </div>
+      )}
       {/* Messages */}
       <div className="flex-1 overflow-y-auto chat-scroll px-6 py-6">
         <div className="max-w-3xl mx-auto space-y-6">
@@ -440,7 +647,31 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
                     )
                   ) : (
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                    <>
+                      {msg.attachments && msg.attachments.length > 0 && (
+                        <div className="flex flex-wrap gap-2 mb-2">
+                          {msg.attachments.map((att, ai) =>
+                            att.content_type.startsWith('image/') ? (
+                              <a key={ai} href={getUploadUrl(att.file_id)} target="_blank" rel="noopener noreferrer">
+                                <img
+                                  src={getUploadUrl(att.file_id)}
+                                  alt={att.filename}
+                                  className="max-w-[200px] max-h-[150px] rounded-lg object-cover border border-white/30"
+                                />
+                              </a>
+                            ) : (
+                              <div key={ai} className="flex items-center gap-1.5 bg-white/20 rounded-lg px-3 py-1.5 text-xs">
+                                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                                </svg>
+                                {att.filename}
+                              </div>
+                            )
+                          )}
+                        </div>
+                      )}
+                      <p className="whitespace-pre-wrap">{msg.content}</p>
+                    </>
                   )}
                   {isStreaming &&
                     i === messages.length - 1 &&
@@ -465,6 +696,44 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
       {/* Input */}
       <div className="px-6 pb-6 pt-2">
         <div className="max-w-3xl mx-auto relative">
+          {/* Attachment preview strip */}
+          {pendingFiles.length > 0 && (
+            <div className="flex flex-wrap gap-2 mb-2 px-1">
+              {pendingFiles.map((att, i) => (
+                <div key={i} className="relative group">
+                  {att.preview ? (
+                    <img src={att.preview} alt={att.file.name} className="w-16 h-16 rounded-lg object-cover border border-sand-200" />
+                  ) : (
+                    <div className="w-16 h-16 rounded-lg border border-sand-200 bg-sand-50 flex flex-col items-center justify-center">
+                      <svg className="w-5 h-5 text-sand-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                      </svg>
+                      <span className="text-[9px] text-sand-500 mt-0.5 truncate max-w-[56px] px-1">{att.file.name}</span>
+                    </div>
+                  )}
+                  <button
+                    onClick={() => removeFile(i)}
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-sand-600 text-white
+                               flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    &times;
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {/* Hidden file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept="image/png,image/jpeg,image/gif,image/webp,application/pdf"
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files?.length) addFiles(e.target.files);
+              e.target.value = '';
+            }}
+          />
           <textarea
             ref={inputRef}
             value={input}
@@ -474,6 +743,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
               e.target.style.height = e.target.scrollHeight + 'px';
             }}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             placeholder="Describe your experiment..."
             rows={1}
             className="w-full resize-none rounded-2xl border border-sand-200 shadow-sm
@@ -505,7 +775,38 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
               <svg className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 text-sand-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
             </div>
           )}
-          <div className="absolute right-3 bottom-3">
+          <div className="absolute right-3 bottom-3 flex items-center gap-1.5">
+            {/* Paperclip — attach files */}
+            {!isStreaming && (
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="w-9 h-9 rounded-xl border border-sand-200
+                           flex items-center justify-center text-sand-400
+                           hover:text-sand-600 hover:bg-sand-50 transition-colors"
+                title="Attach image or PDF"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13" />
+                </svg>
+              </button>
+            )}
+            {/* Microphone — speech-to-text */}
+            {!isStreaming && speechSupported && (
+              <button
+                onClick={toggleListening}
+                className={`w-9 h-9 rounded-xl border flex items-center justify-center transition-colors ${
+                  isListening
+                    ? 'border-red-300 bg-red-50 text-red-500 animate-pulse'
+                    : 'border-sand-200 text-sand-400 hover:text-sand-600 hover:bg-sand-50'
+                }`}
+                title={isListening ? 'Stop listening' : 'Voice input'}
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
+                </svg>
+              </button>
+            )}
+            {/* Send / Stop */}
             {isStreaming ? (
               <button
                 onClick={() => abortControllerRef.current?.abort()}
@@ -520,7 +821,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
             ) : (
               <button
                 onClick={handleSend}
-                disabled={!input.trim()}
+                disabled={!input.trim() && pendingFiles.length === 0}
                 className="w-9 h-9 rounded-xl bg-brand-fig
                            flex items-center justify-center text-white
                            hover:bg-brand-magenta-600 transition-colors

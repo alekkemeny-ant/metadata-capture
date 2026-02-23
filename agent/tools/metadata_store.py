@@ -335,12 +335,18 @@ async def delete_session(session_id: str) -> bool:
 # Conversation history helpers
 # ---------------------------------------------------------------------------
 
-async def save_conversation_turn(session_id: str, role: str, content: str) -> None:
-    """Persist a single conversation turn."""
+async def save_conversation_turn(
+    session_id: str,
+    role: str,
+    content: str,
+    attachments: list[dict] | None = None,
+) -> None:
+    """Persist a single conversation turn, optionally with attachment metadata."""
     db = await get_db()
+    attachments_json = json.dumps(attachments) if attachments else None
     await db.execute(
-        "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
-        (session_id, role, content),
+        "INSERT INTO conversations (session_id, role, content, attachments_json) VALUES (?, ?, ?, ?)",
+        (session_id, role, content, attachments_json),
     )
     await db.commit()
 
@@ -349,8 +355,50 @@ async def get_conversation_history(session_id: str) -> list[dict[str, Any]]:
     """Retrieve full conversation history for a session."""
     db = await get_db()
     cursor = await db.execute(
-        "SELECT role, content, created_at FROM conversations WHERE session_id = ? ORDER BY created_at ASC",
+        "SELECT role, content, attachments_json, created_at FROM conversations WHERE session_id = ? ORDER BY created_at ASC",
         (session_id,),
     )
     rows = await cursor.fetchall()
-    return [dict(r) for r in rows]
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d.get("attachments_json"):
+            d["attachments_json"] = _parse_json(d["attachments_json"])
+        result.append(d)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Upload management
+# ---------------------------------------------------------------------------
+
+async def save_upload(
+    upload_id: str,
+    original_filename: str,
+    content_type: str,
+    file_path: str,
+    size_bytes: int,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist an upload record."""
+    db = await get_db()
+    await db.execute(
+        """INSERT INTO uploads (id, original_filename, content_type, file_path, size_bytes, session_id)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (upload_id, original_filename, content_type, file_path, size_bytes, session_id),
+    )
+    await db.commit()
+    return {
+        "id": upload_id,
+        "filename": original_filename,
+        "content_type": content_type,
+        "size": size_bytes,
+    }
+
+
+async def get_upload(upload_id: str) -> dict[str, Any] | None:
+    """Fetch an upload record by ID."""
+    db = await get_db()
+    cursor = await db.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+    row = await cursor.fetchone()
+    return dict(row) if row else None

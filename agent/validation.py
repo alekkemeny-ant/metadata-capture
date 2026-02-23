@@ -45,7 +45,7 @@ REQUIRED_FIELDS_BY_TYPE: dict[str, list[str]] = {
     "data_description": ["modality", "project_name"],
     "session": ["session_start_time"],
     "procedures": [],
-    "instrument": [],
+    "instrument": ["instrument_id"],
     "acquisition": [],
     "processing": [],
     "quality_control": [],
@@ -298,12 +298,54 @@ def _validate_procedures(data: dict, result: ValidationResult) -> None:
             )
 
 
+def _validate_instrument(data: dict, result: ValidationResult) -> None:
+    """Validate instrument fields against aind-data-schema Instrument model."""
+    iid = data.get("instrument_id")
+    if iid is not None:
+        if not str(iid).strip():
+            result.add_error("instrument_id", "instrument_id must be a non-empty string")
+        else:
+            result.add_valid("instrument_id")
+
+    modalities = data.get("modalities")
+    if modalities is not None:
+        if isinstance(modalities, list):
+            for i, mod in enumerate(modalities):
+                abbr = mod.get("abbreviation") if isinstance(mod, dict) else mod
+                if abbr is not None and abbr not in VALID_MODALITIES:
+                    result.add_error(
+                        f"modalities[{i}]",
+                        f"Invalid modality '{abbr}'. Must be one of: {', '.join(sorted(VALID_MODALITIES))}",
+                    )
+                elif abbr is not None:
+                    result.add_valid(f"modalities[{i}]")
+
+    components = data.get("components")
+    if components is not None:
+        if not isinstance(components, list):
+            result.add_error("components", "components must be a list of device objects")
+        elif len(components) == 0:
+            result.add_warning("components", "components list is empty — add device entries")
+
+    mod_date = data.get("modification_date")
+    if mod_date is not None:
+        try:
+            datetime.strptime(str(mod_date), "%Y-%m-%d")
+            result.add_valid("modification_date")
+        except ValueError:
+            result.add_error(
+                "modification_date",
+                f"Invalid date format '{mod_date}'. Expected ISO 8601 date (YYYY-MM-DD)",
+            )
+
+
 # Type -> validator function mapping
 _VALIDATORS: dict[str, Any] = {
     "subject": _validate_subject,
     "data_description": _validate_data_description,
     "session": _validate_session,
     "procedures": _validate_procedures,
+    "instrument": _validate_instrument,
 }
 
 

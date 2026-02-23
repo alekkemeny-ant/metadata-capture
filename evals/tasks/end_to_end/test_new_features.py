@@ -615,3 +615,111 @@ def test_link_records_http(client):
     resp = _run(client.get(f"/records/{id1}/links"))
     assert resp.status_code == 200
     assert any(l["id"] == id2 for l in resp.json())
+
+
+# ---------------------------------------------------------------------------
+# Test 30: POST /upload — accepts image
+# ---------------------------------------------------------------------------
+
+
+def test_upload_endpoint_accepts_image(client):
+    # Create a minimal 1x1 PNG
+    import struct, zlib
+    def _make_png():
+        sig = b'\x89PNG\r\n\x1a\n'
+        ihdr_data = struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)
+        ihdr_crc = zlib.crc32(b'IHDR' + ihdr_data) & 0xFFFFFFFF
+        ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_data + struct.pack('>I', ihdr_crc)
+        raw = b'\x00\x00\x00\x00'
+        compressed = zlib.compress(raw)
+        idat_crc = zlib.crc32(b'IDAT' + compressed) & 0xFFFFFFFF
+        idat = struct.pack('>I', len(compressed)) + b'IDAT' + compressed + struct.pack('>I', idat_crc)
+        iend_crc = zlib.crc32(b'IEND') & 0xFFFFFFFF
+        iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_crc)
+        return sig + ihdr + idat + iend
+
+    png_bytes = _make_png()
+    resp = _run(client.post("/upload", files={"file": ("test.png", png_bytes, "image/png")}))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "id" in data
+    assert data["filename"] == "test.png"
+    assert data["content_type"] == "image/png"
+
+
+# ---------------------------------------------------------------------------
+# Test 31: POST /upload — rejects unsupported type
+# ---------------------------------------------------------------------------
+
+
+def test_upload_endpoint_rejects_unsupported_type(client):
+    resp = _run(client.post("/upload", files={"file": ("evil.exe", b"MZ\x90\x00", "application/x-msdownload")}))
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Test 32: GET /uploads/{id} — serves uploaded file
+# ---------------------------------------------------------------------------
+
+
+def test_upload_serves_file(client):
+    png_bytes = b'\x89PNG\r\n\x1a\n' + b'\x00' * 50
+    resp = _run(client.post("/upload", files={"file": ("img.png", png_bytes, "image/png")}))
+    assert resp.status_code == 200
+    file_id = resp.json()["id"]
+
+    resp2 = _run(client.get(f"/uploads/{file_id}"))
+    assert resp2.status_code == 200
+    assert resp2.headers["content-type"].startswith("image/png")
+
+
+# ---------------------------------------------------------------------------
+# Test 33: GET /uploads/{id} — not found
+# ---------------------------------------------------------------------------
+
+
+def test_upload_not_found(client):
+    resp = _run(client.get("/uploads/nonexistent-id"))
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Test 34: Chat with attachments saves attachment metadata
+# ---------------------------------------------------------------------------
+
+
+def test_chat_with_attachments_saves_metadata(client):
+    # First upload a file
+    resp = _run(client.post("/upload", files={"file": ("lab.png", b'\x89PNG' + b'\x00' * 20, "image/png")}))
+    assert resp.status_code == 200
+    file_id = resp.json()["id"]
+
+    # Send chat with attachment — just check it doesn't error
+    resp2 = _run(client.post("/chat", json={
+        "message": "Look at this image",
+        "attachments": [{"file_id": file_id, "filename": "lab.png", "content_type": "image/png"}],
+    }))
+    assert resp2.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Test 35: Messages endpoint returns attachment metadata
+# ---------------------------------------------------------------------------
+
+
+def test_messages_include_attachments(client):
+    from agent.tools.metadata_store import save_conversation_turn
+
+    _run(save_conversation_turn(
+        "att-session", "user", "See attached",
+        attachments=[{"file_id": "f1", "filename": "photo.jpg", "content_type": "image/jpeg"}]
+    ))
+
+    resp = _run(client.get("/sessions/att-session/messages"))
+    assert resp.status_code == 200
+    msgs = resp.json()
+    assert len(msgs) >= 1
+    msg = msgs[0]
+    assert msg["attachments_json"] is not None
+    atts = msg["attachments_json"] if isinstance(msg["attachments_json"], list) else json.loads(msg["attachments_json"])
+    assert atts[0]["file_id"] == "f1"

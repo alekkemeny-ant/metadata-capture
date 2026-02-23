@@ -38,6 +38,19 @@ CREATE TABLE IF NOT EXISTS conversations (
     session_id TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content TEXT NOT NULL,
+    attachments_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+UPLOADS_TABLE = """
+CREATE TABLE IF NOT EXISTS uploads (
+    id TEXT PRIMARY KEY,
+    original_filename TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    session_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -52,7 +65,11 @@ CREATE INDEX IF NOT EXISTS idx_links_target ON record_links(target_id);
 CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id);
 """
 
-ALL_TABLES = [METADATA_RECORDS_TABLE, RECORD_LINKS_TABLE, CONVERSATIONS_TABLE, CREATE_INDEXES]
+CREATE_INDEXES_UPLOADS = """
+CREATE INDEX IF NOT EXISTS idx_uploads_session ON uploads(session_id);
+"""
+
+ALL_TABLES = [METADATA_RECORDS_TABLE, RECORD_LINKS_TABLE, CONVERSATIONS_TABLE, UPLOADS_TABLE, CREATE_INDEXES, CREATE_INDEXES_UPLOADS]
 
 # Category mapping: record_type -> category
 CATEGORY_MAP = {
