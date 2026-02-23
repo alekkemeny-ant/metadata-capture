@@ -496,3 +496,29 @@
     - instrument
     - procedures
   check_type: "absence"
+
+# ---------------------------------------------------------------------------
+# Suite — Instrument extraction
+# ---------------------------------------------------------------------------
+- id: instrument_from_description
+  type: extraction
+  description: Extract instrument record from device description with serial number
+  input: "We're using a Neuropixels 2.0 probe, serial number 12345678, manufactured by IMEC"
+  expected:
+    instrument:
+      instrument_id: "12345678"
+  absent_keys:
+    - subject
+    - session
+  check_type: "presence"
+
+- id: instrument_with_modality
+  type: extraction
+  description: Extract instrument from two-photon microscope description
+  input: "Our two-photon microscope (instrument ID scope-001) has a Coherent Chameleon laser and a Nikon 16x objective"
+  expected:
+    instrument:
+      instrument_id: "scope-001"
+  absent_keys:
+    - subject
+  check_type: "presence"

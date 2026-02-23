@@ -32,9 +32,23 @@ export interface Session {
   first_message: string | null;
 }
 
+export interface MessageAttachment {
+  file_id: string;
+  filename: string;
+  content_type: string;
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
+  attachments?: MessageAttachment[];
+}
+
+export interface UploadedFile {
+  id: string;
+  filename: string;
+  content_type: string;
+  size: number;
 }
 
 export interface ModelInfo {
@@ -52,6 +66,24 @@ export async function fetchModels(): Promise<ModelInfo> {
   }
 }
 
+export async function uploadFile(file: File, sessionId?: string): Promise<UploadedFile> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const url = sessionId
+    ? `${API_BASE}/upload?session_id=${encodeURIComponent(sessionId)}`
+    : `${API_BASE}/upload`;
+  const res = await fetch(url, { method: 'POST', body: formData });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Upload failed (${res.status}): ${detail}`);
+  }
+  return res.json();
+}
+
+export function getUploadUrl(fileId: string): string {
+  return `${API_BASE}/uploads/${fileId}`;
+}
+
 export async function sendChatMessage(
   message: string,
   sessionId: string | null,
@@ -60,6 +92,7 @@ export async function sendChatMessage(
   onError: (err: Error) => void,
   signal?: AbortSignal,
   model?: string,
+  attachments?: MessageAttachment[],
 ) {
   try {
     const res = await fetch(`${API_BASE}/chat`, {
@@ -69,6 +102,7 @@ export async function sendChatMessage(
         message,
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(model ? { model } : {}),
+        ...(attachments?.length ? { attachments } : {}),
       }),
       signal,
     });
@@ -129,8 +163,12 @@ export async function sendChatMessage(
 export async function fetchMessages(sessionId: string): Promise<ChatMessage[]> {
   const res = await fetch(`${API_BASE}/sessions/${sessionId}/messages`);
   if (!res.ok) throw new Error(`Failed to fetch messages: ${res.status}`);
-  const data: { role: string; content: string }[] = await res.json();
-  return data.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+  const data: { role: string; content: string; attachments_json?: MessageAttachment[] | null }[] = await res.json();
+  return data.map((m) => ({
+    role: m.role as 'user' | 'assistant',
+    content: m.content,
+    ...(m.attachments_json ? { attachments: m.attachments_json } : {}),
+  }));
 }
 
 // ---------------------------------------------------------------------------

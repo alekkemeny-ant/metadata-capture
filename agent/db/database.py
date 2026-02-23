@@ -30,6 +30,11 @@ async def init_db() -> None:
     db = await get_db()
     for ddl in ALL_TABLES:
         await db.executescript(ddl)
+    # Migrate: add attachments_json to conversations if missing
+    cursor = await db.execute("PRAGMA table_info(conversations)")
+    cols = {row[1] for row in await cursor.fetchall()}
+    if "attachments_json" not in cols:
+        await db.execute("ALTER TABLE conversations ADD COLUMN attachments_json TEXT")
     await db.commit()
 
 

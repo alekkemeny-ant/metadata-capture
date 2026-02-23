@@ -472,3 +472,60 @@ def test_species_ncbi_enrichment(client):
             "the NCBI registry information."
         ),
     })
+
+
+# ===========================================================================
+# Instrument capture from text description
+# ===========================================================================
+
+
+@pytest.mark.llm
+@pytest.mark.network
+def test_instrument_capture_from_description(client):
+    """Agent should create an instrument record when given device details."""
+    prompt = (
+        "We're using a Neuropixels 2.0 probe manufactured by IMEC, "
+        "serial number NP2-20240315-001"
+    )
+    response = _run(_send_chat(client, prompt))
+
+    # Deterministic: instrument record should exist with instrument_id
+    records = _run(_get_records(client, record_type="instrument"))
+    assert len(records) >= 1, f"Expected at least 1 instrument record, got {len(records)}"
+    instr = records[0]
+    data = instr.get("data_json") or {}
+    if isinstance(data, str):
+        data = json.loads(data)
+    assert data.get("instrument_id"), f"instrument_id should be set, got: {data}"
+
+    # LLM: agent should acknowledge the instrument details
+    _grade(response, prompt, {
+        "instrument_identification": (
+            "Did the agent identify and acknowledge the Neuropixels 2.0 probe "
+            "with its serial number and manufacturer?"
+        ),
+        "record_creation": (
+            "Did the agent create or indicate creation of an instrument record "
+            "for the device?"
+        ),
+    })
+
+
+@pytest.mark.llm
+@pytest.mark.network
+def test_multimodal_text_only_fallback(client):
+    """Plain text message without attachments should still work normally."""
+    prompt = "I performed a surgery on mouse 998877 today"
+    response = _run(_send_chat(client, prompt))
+
+    # Deterministic: subject record should be created
+    records = _run(_get_records(client, record_type="subject"))
+    assert len(records) >= 1, f"Expected at least 1 subject record, got {len(records)}"
+
+    # LLM: agent should respond normally
+    _grade(response, prompt, {
+        "normal_response": (
+            "Did the agent respond appropriately to the surgery description, "
+            "acknowledging the subject and procedure?"
+        ),
+    })

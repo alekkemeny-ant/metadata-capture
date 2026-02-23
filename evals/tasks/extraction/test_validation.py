@@ -653,3 +653,89 @@ class TestExtractRegistryQueriesAAV:
         data = {"injection_materials": [{"name": "AAV9"}]}
         queries = _extract_registry_queries("procedures", data)
         assert "addgene" in queries
+
+
+# ---------------------------------------------------------------------------
+# Instrument validation
+# ---------------------------------------------------------------------------
+
+class TestInstrumentValidation:
+    """Validate instrument records against aind-data-schema Instrument model."""
+
+    def test_instrument_requires_instrument_id(self):
+        """Missing instrument_id should be flagged as missing required field."""
+        result = validate_record("instrument", {"notes": "some instrument"})
+        assert "instrument_id" in result.missing_required
+
+    def test_instrument_valid_instrument_id(self):
+        """Present instrument_id should appear in valid_fields."""
+        result = validate_record("instrument", {"instrument_id": "PROBE-001"})
+        assert "instrument_id" not in result.missing_required
+        assert "instrument_id" in result.valid_fields
+
+    def test_instrument_empty_instrument_id_error(self):
+        """Empty string instrument_id should produce an error."""
+        result = validate_record("instrument", {"instrument_id": "  "})
+        errors = [i for i in result.issues if i.severity == "error"]
+        assert any("instrument_id" in e.field for e in errors)
+
+    def test_instrument_valid_modalities(self):
+        """Valid modality abbreviations should pass."""
+        result = validate_record("instrument", {
+            "instrument_id": "SCOPE-001",
+            "modalities": [{"abbreviation": "ecephys"}, {"abbreviation": "fib"}],
+        })
+        errors = [i for i in result.issues if i.severity == "error"]
+        assert not any("modalities" in e.field for e in errors)
+
+    def test_instrument_invalid_modality(self):
+        """Invalid modality abbreviation should produce an error."""
+        result = validate_record("instrument", {
+            "instrument_id": "SCOPE-001",
+            "modalities": [{"abbreviation": "not_a_modality"}],
+        })
+        errors = [i for i in result.issues if i.severity == "error"]
+        assert any("modalities" in e.field for e in errors)
+
+    def test_instrument_components_list(self):
+        """Valid components list should pass without warnings."""
+        result = validate_record("instrument", {
+            "instrument_id": "SCOPE-001",
+            "components": [{"device_type": "Laser", "name": "Coherent Chameleon"}],
+        })
+        warnings = [i for i in result.issues if i.severity == "warning"]
+        assert not any("components" in w.field for w in warnings)
+
+    def test_instrument_empty_components_warning(self):
+        """Empty components list should produce a warning."""
+        result = validate_record("instrument", {
+            "instrument_id": "SCOPE-001",
+            "components": [],
+        })
+        warnings = [i for i in result.issues if i.severity == "warning"]
+        assert any("components" in w.field for w in warnings)
+
+    def test_instrument_modification_date_valid(self):
+        """Valid ISO date should pass."""
+        result = validate_record("instrument", {
+            "instrument_id": "SCOPE-001",
+            "modification_date": "2025-01-15",
+        })
+        errors = [i for i in result.issues if i.severity == "error"]
+        assert not any("modification_date" in e.field for e in errors)
+
+    def test_instrument_modification_date_invalid(self):
+        """Invalid date format should produce an error."""
+        result = validate_record("instrument", {
+            "instrument_id": "SCOPE-001",
+            "modification_date": "Jan 15 2025",
+        })
+        errors = [i for i in result.issues if i.severity == "error"]
+        assert any("modification_date" in e.field for e in errors)
+
+    def test_instrument_completeness_score(self):
+        """Completeness should be 0.0 without instrument_id, 1.0 with it."""
+        result_missing = validate_record("instrument", {"notes": "test"})
+        result_present = validate_record("instrument", {"instrument_id": "X"})
+        assert result_missing.completeness_score == 0.0
+        assert result_present.completeness_score == 1.0

@@ -1,6 +1,7 @@
 """Core agent service that wraps the Claude Code SDK for metadata capture."""
 
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -109,7 +110,18 @@ def _format_conversation_context(history: list[dict[str, Any]], user_message: st
         parts.append("Previous conversation:")
         for turn in history[-10:]:  # Keep last 10 turns for context
             role = turn["role"].upper()
-            parts.append(f"{role}: {turn['content']}")
+            content = turn["content"]
+            # Add markers for attachments in history so agent knows what was shared
+            attachments = turn.get("attachments_json")
+            if attachments and isinstance(attachments, list):
+                for att in attachments:
+                    ct = att.get("content_type", "")
+                    fname = att.get("filename", "file")
+                    if ct.startswith("image/"):
+                        content += f"\n[Attached image: {fname}]"
+                    elif ct == "application/pdf":
+                        content += f"\n[Attached PDF: {fname}]"
+            parts.append(f"{role}: {content}")
         parts.append("")
 
     parts.append(f"USER: {user_message}")
@@ -130,7 +142,7 @@ def _format_records_context(records: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-async def _create_message_stream(prompt: str):
+async def _create_message_stream(prompt: str | list[dict[str, Any]]):
     """Create an async generator for streaming input to the SDK."""
     yield {
         "type": "user",
@@ -141,7 +153,53 @@ async def _create_message_stream(prompt: str):
     }
 
 
-async def chat(session_id: str, user_message: str, model: str | None = None) -> AsyncIterator[dict[str, Any]]:
+def _build_multimodal_content(
+    text_prompt: str, attachments: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build Claude API content blocks from text + file attachments."""
+    content_blocks: list[dict[str, Any]] = []
+
+    for att in attachments:
+        file_path = Path(att.get("file_path", ""))
+        content_type = att.get("content_type", "")
+
+        if not file_path.exists():
+            logger.warning("Attachment file not found: %s", file_path)
+            continue
+
+        raw = file_path.read_bytes()
+        b64_data = base64.standard_b64encode(raw).decode("ascii")
+
+        if content_type.startswith("image/"):
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": content_type,
+                    "data": b64_data,
+                },
+            })
+        elif content_type == "application/pdf":
+            content_blocks.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": b64_data,
+                },
+            })
+
+    # Text prompt always comes last
+    content_blocks.append({"type": "text", "text": text_prompt})
+    return content_blocks
+
+
+async def chat(
+    session_id: str,
+    user_message: str,
+    model: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> AsyncIterator[dict[str, Any]]:
     """Process a chat message and stream the agent's response.
 
     Yields dicts with keys:
@@ -149,8 +207,14 @@ async def chat(session_id: str, user_message: str, model: str | None = None) -> 
     - {"session_id": str} sent once at the start
     - {"done": True} when complete
     """
-    # Save the user's message
-    await save_conversation_turn(session_id, "user", user_message)
+    # Save the user's message (with attachment metadata if present)
+    attachment_meta = None
+    if attachments:
+        attachment_meta = [
+            {"file_id": a["file_id"], "filename": a["filename"], "content_type": a["content_type"]}
+            for a in attachments
+        ]
+    await save_conversation_turn(session_id, "user", user_message, attachments=attachment_meta)
 
     # Send session_id first
     yield {"session_id": session_id}
@@ -168,6 +232,26 @@ async def chat(session_id: str, user_message: str, model: str | None = None) -> 
     # Add session_id context for the capture tools
     prompt += f"\n\nIMPORTANT: When calling capture_metadata, always use session_id=\"{session_id}\""
 
+    # Build multimodal content if attachments are present
+    if attachments:
+        # Resolve file paths from upload records
+        resolved_attachments = []
+        for att in attachments:
+            from .tools.metadata_store import get_upload
+            upload = await get_upload(att["file_id"])
+            if upload:
+                resolved_attachments.append({
+                    "file_path": upload["file_path"],
+                    "content_type": att["content_type"],
+                    "filename": att["filename"],
+                })
+        if resolved_attachments:
+            prompt_content = _build_multimodal_content(prompt, resolved_attachments)
+        else:
+            prompt_content = prompt
+    else:
+        prompt_content = prompt
+
     # Run the agent with streaming input (required for custom MCP tools)
     options = _build_options(model=model)
     full_response: list[str] = []
@@ -183,7 +267,7 @@ async def chat(session_id: str, user_message: str, model: str | None = None) -> 
     last_capture_tool_use_id: str | None = None
 
     try:
-        async for message in query(prompt=_create_message_stream(prompt), options=options):
+        async for message in query(prompt=_create_message_stream(prompt_content), options=options):
             # Drain any pending validation results pushed by tool handlers.
             # These arrive after the tool executes (between the tool_use
             # AssistantMessage and the next text response).

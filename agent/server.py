@@ -3,16 +3,23 @@
 import json
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .db.database import close_db, init_db
 from .service import AVAILABLE_MODELS, DEFAULT_MODEL, chat, get_session_messages, get_sessions
+
+UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
+ALLOWED_CONTENT_TYPES = {
+    "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf",
+}
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
 
 # Load environment variables from .env file
 load_dotenv()
@@ -42,10 +49,17 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 
+class AttachmentRef(BaseModel):
+    file_id: str
+    filename: str
+    content_type: str
+
+
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
     model: str | None = None
+    attachments: list[AttachmentRef] | None = None
 
 
 class LinkRequest(BaseModel):
@@ -66,9 +80,10 @@ class UpdateRecordDataRequest(BaseModel):
 async def chat_endpoint(req: ChatRequest):
     """Stream a chat response using Server-Sent Events."""
     session_id = req.session_id or str(uuid.uuid4())
+    attachments = [a.model_dump() for a in req.attachments] if req.attachments else None
 
     async def event_stream():
-        async for chunk in chat(session_id, req.message, model=req.model):
+        async for chunk in chat(session_id, req.message, model=req.model, attachments=attachments):
             yield f"data: {json.dumps(chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -224,6 +239,62 @@ async def delete_session_endpoint(session_id: str):
     if not deleted:
         raise HTTPException(status_code=404, detail="No data found for this session")
     return {"status": "deleted", "session_id": session_id}
+
+
+# ---------------------------------------------------------------------------
+# Upload endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile, session_id: str | None = None):
+    """Upload a file (image or PDF) for use in chat messages."""
+    from .tools.metadata_store import save_upload
+
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {file.content_type}. Allowed: {', '.join(sorted(ALLOWED_CONTENT_TYPES))}",
+        )
+
+    contents = await file.read()
+    if len(contents) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="File too large. Maximum size is 20 MB.")
+
+    file_id = str(uuid.uuid4())
+    ext = Path(file.filename or "file").suffix or ".bin"
+    dest = UPLOADS_DIR / f"{file_id}{ext}"
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(contents)
+
+    return await save_upload(
+        upload_id=file_id,
+        original_filename=file.filename or "unknown",
+        content_type=file.content_type or "application/octet-stream",
+        file_path=str(dest),
+        size_bytes=len(contents),
+        session_id=session_id,
+    )
+
+
+@app.get("/uploads/{file_id}")
+async def get_uploaded_file(file_id: str):
+    """Serve an uploaded file by ID."""
+    from .tools.metadata_store import get_upload
+
+    upload = await get_upload(file_id)
+    if upload is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    file_path = Path(upload["file_path"])
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    return FileResponse(
+        path=str(file_path),
+        media_type=upload["content_type"],
+        filename=upload["original_filename"],
+    )
 
 
 # ---------------------------------------------------------------------------
