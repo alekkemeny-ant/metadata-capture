@@ -31,7 +31,7 @@ outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "cd /home/runner/workspace && fuser -k 8001/tcp 2>/dev/null; sleep 1; python -m agent.run & cd /home/runner/workspace/frontend && npm run dev"
+args = "cd /home/runner/workspace && python -m agent.run & cd /home/runner/workspace/frontend && npm run dev"
 waitForPort = 5000
 
 [[ports]]
