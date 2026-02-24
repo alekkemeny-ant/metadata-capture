@@ -6,7 +6,7 @@ import uvicorn
 def main():
     uvicorn.run(
         "agent.server:app",
-        host="0.0.0.0",
+        host="localhost",
         port=8001,
         reload=True,
     )
