@@ -27,7 +27,7 @@ workspace/
 │   │   ├── components/  # React components
 │   │   └── lib/api.ts   # API client
 │   └── next.config.mjs  # Rewrites proxy API to backend
-├── aind-metadata-mcp/   # MCP server package
+├── aind-metadata-mcp/   # MCP server package (installed as editable)
 └── evals/               # Evaluation suite
 ```
 
@@ -37,14 +37,22 @@ workspace/
 - Frontend: `npm run dev` from frontend/ (0.0.0.0:5000)
 - Next.js rewrites proxy all API calls from frontend to backend
 
+## Dependencies
+- Python: `pip install -r agent/requirements.txt && pip install -e ./aind-metadata-mcp`
+- Node.js: `cd frontend && npm install`
+- Claude Code CLI: `npm install -g @anthropic-ai/claude-code` (required by claude-agent-sdk)
+
 ## Key Configuration
 - Next.js configured with `allowedDevOrigins: ['*']` for Replit proxy
 - API calls proxied via Next.js rewrites (no direct backend access from browser)
-- NEXT_PUBLIC_API_URL env var set to empty string (uses same origin + rewrites)
+- API_BASE in frontend defaults to empty string (uses same origin + rewrites)
+- ANTHROPIC_API_KEY must be set as a Replit secret
 
 ## Recent Changes
 - 2026-02-24: Configured for Replit environment
   - Set Next.js to port 5000 with all hosts allowed
   - Set backend to localhost:8001
   - Added Next.js rewrites to proxy API calls to backend
-  - Set up deployment config (autoscale)
+  - Fixed API_BASE in Header.tsx and api.ts to use empty string (proxy) instead of localhost
+  - Installed claude-code CLI globally for claude-agent-sdk
+  - Installed aind-metadata-mcp as editable local package
