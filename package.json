@@ -1,0 +1,12 @@
+{
+  "name": "aind-metadata-capture",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "install:frontend": "cd frontend && npm install",
+    "build": "cd frontend && npm run build",
+    "start": "cd frontend && npm run start",
+    "dev": "cd frontend && npm run dev",
+    "postinstall": "cd frontend && npm install"
+  }
+}
