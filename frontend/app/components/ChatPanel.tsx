@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { sendChatMessage, fetchMessages, fetchModels, uploadFile, getUploadUrl, ChatMessage, MessageAttachment } from '../lib/api';
+import { sendChatMessage, fetchMessages, fetchModels, uploadFile, getUploadUrl, MessageAttachment } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // File attachment types

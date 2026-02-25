@@ -23,7 +23,7 @@ const RECORD_TYPE_LABELS: Record<string, string> = {
 
 const SHARED_TYPES = ['subject', 'procedures', 'instrument', 'rig'];
 const ASSET_TYPES = ['data_description', 'acquisition', 'session', 'processing', 'quality_control'];
-const ALL_TYPES = [...SHARED_TYPES, ...ASSET_TYPES];
+
 
 /** Known fields per record type — shown as placeholders. */
 const FIELD_SCHEMAS: Record<string, { label: string; key: string }[]> = {
@@ -81,7 +81,7 @@ function humanize(v: unknown): string {
     .join(', ');
 }
 
-function StatusBadge({ status }: { status: string }) {
+function _StatusBadge({ status }: { status: string }) {
   const styles: Record<string, string> = {
     draft: 'bg-brand-orange-100 text-brand-orange-600 border-brand-orange-500/20',
     validated: 'bg-brand-violet-500/10 text-brand-violet-600 border-brand-violet-500/20',
@@ -253,7 +253,7 @@ function RecordEditor({
   const deleteField = async (key: string) => {
     const parts = key.split('.');
     const topKey = parts[0];
-    const { [topKey]: _, ...rest } = data;
+    const { [topKey]: _unused, ...rest } = data;
     try {
       await updateRecordData(record.id, rest);
       onSaved();
@@ -496,8 +496,8 @@ function SessionView({
 
 function LibraryView({
   records,
-  expandedId,
-  onToggle,
+  expandedId: _expandedId,
+  onToggle: _onToggle,
   onConfirm,
   onFieldSaved,
 }: {

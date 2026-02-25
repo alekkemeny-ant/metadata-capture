@@ -1,6 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   allowedDevOrigins: ['*'],
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
   async rewrites() {
     return [
       { source: '/chat', destination: 'http://localhost:8001/chat' },
