@@ -1,15 +1,33 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Header from './components/Header';
 import SessionsSidebar from './components/SessionsSidebar';
 import ChatPanel from './components/ChatPanel';
 import MetadataSidebar from './components/MetadataSidebar';
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+
 export default function Home() {
   const [sessionsSidebarOpen, setSessionsSidebarOpen] = useState(true);
   const [metadataSidebarOpen, setMetadataSidebarOpen] = useState(true);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [agentOnline, setAgentOnline] = useState(false);
+
+  const checkHealth = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(3000) });
+      setAgentOnline(res.ok);
+    } catch {
+      setAgentOnline(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    checkHealth();
+    const interval = setInterval(checkHealth, 5000);
+    return () => clearInterval(interval);
+  }, [checkHealth]);
 
   // Restore session from sessionStorage on mount
   useEffect(() => {
@@ -34,7 +52,7 @@ export default function Home() {
 
   return (
     <div className="h-screen flex flex-col bg-white">
-      <Header />
+      <Header agentOnline={agentOnline} />
       <div className="flex-1 flex overflow-hidden">
         {/* Sessions Sidebar */}
         <div
@@ -72,6 +90,7 @@ export default function Home() {
           <ChatPanel
             sessionId={sessionId}
             onSessionChange={handleSelectSession}
+            agentOnline={agentOnline}
           />
         </div>
 

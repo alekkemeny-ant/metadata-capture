@@ -31,7 +31,7 @@ outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "cd /home/runner/workspace && fuser -k 8001/tcp 2>/dev/null; sleep 1; python -m agent.run & cd /home/runner/workspace/frontend && npm run dev"
+args = "cd /home/runner/workspace && python -m agent.run & sleep 3 && cd /home/runner/workspace/frontend && npm run dev"
 waitForPort = 5000
 
 [[ports]]
@@ -39,6 +39,6 @@ localPort = 5000
 externalPort = 80
 
 [deployment]
-deploymentTarget = "vm"
+deploymentTarget = "autoscale"
 run = ["bash", "-c", "export REPLIT_DEPLOYMENT=1 && cd /home/runner/workspace && python -m agent.run & sleep 3 && cd /home/runner/workspace/frontend && npm run start"]
 build = ["bash", "-c", "pip install -r agent/requirements.txt && pip install -e ./aind-metadata-mcp && npm install -g @anthropic-ai/claude-code && cd frontend && npm install && npm run build"]

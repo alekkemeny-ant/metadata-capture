@@ -11,24 +11,31 @@ const NAV_ITEMS = [
   { href: '/dashboard', label: 'Dashboard' },
 ];
 
-export default function Header() {
+interface HeaderProps {
+  agentOnline?: boolean;
+}
+
+export default function Header({ agentOnline }: HeaderProps) {
   const pathname = usePathname();
-  const [online, setOnline] = useState(false);
+  const [localOnline, setLocalOnline] = useState(false);
 
   const checkHealth = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(3000) });
-      setOnline(res.ok);
+      setLocalOnline(res.ok);
     } catch {
-      setOnline(false);
+      setLocalOnline(false);
     }
   }, []);
 
   useEffect(() => {
+    if (agentOnline !== undefined) return;
     checkHealth();
     const interval = setInterval(checkHealth, 5000);
     return () => clearInterval(interval);
-  }, [checkHealth]);
+  }, [agentOnline, checkHealth]);
+
+  const online = agentOnline ?? localOnline;
 
   return (
     <header className="bg-white border-b border-sand-200 px-6 py-3 flex items-center justify-between">
