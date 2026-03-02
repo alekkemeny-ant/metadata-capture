@@ -17,13 +17,14 @@ from claude_agent_sdk.types import (
 )
 
 from .prompts.system_prompt import SYSTEM_PROMPT
-from .shared import validation_events
+from .shared import stream_events
 from .tools.capture_mcp import capture_server
 from .tools.metadata_store import (
     get_conversation_history,
     get_session_records,
     save_conversation_turn,
 )
+from .tools.spreadsheet import SPREADSHEET_CONTENT_TYPES, format_for_prompt, parse_spreadsheet
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +67,12 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
         "mcp__aind-metadata-mcp__identify_nwb_contents_with_s3_link",
     ]
 
-    # Capture tools (capture_metadata, find_records, link_records)
+    # Capture tools (capture_metadata, find_records, link_records, render_artifact)
     capture_tools = [
         "mcp__capture__capture_metadata",
         "mcp__capture__find_records",
         "mcp__capture__link_records",
+        "mcp__capture__render_artifact",
     ]
 
     # Combine all MCP servers
@@ -121,6 +123,8 @@ def _format_conversation_context(history: list[dict[str, Any]], user_message: st
                         content += f"\n[Attached image: {fname}]"
                     elif ct == "application/pdf":
                         content += f"\n[Attached PDF: {fname}]"
+                    elif ct in SPREADSHEET_CONTENT_TYPES:
+                        content += f"\n[Attached spreadsheet: {fname}]"
             parts.append(f"{role}: {content}")
         parts.append("")
 
@@ -162,9 +166,24 @@ def _build_multimodal_content(
     for att in attachments:
         file_path = Path(att.get("file_path", ""))
         content_type = att.get("content_type", "")
+        filename = att.get("filename", file_path.name or "file")
 
         if not file_path.exists():
             logger.warning("Attachment file not found: %s", file_path)
+            continue
+
+        if content_type in SPREADSHEET_CONTENT_TYPES:
+            # Parse spreadsheet and inject as a text block (markdown table)
+            try:
+                parsed = parse_spreadsheet(file_path, content_type)
+                formatted = format_for_prompt(parsed, filename)
+                content_blocks.append({"type": "text", "text": formatted})
+            except Exception as exc:
+                logger.exception("Failed to parse spreadsheet %s: %s", file_path, exc)
+                content_blocks.append({
+                    "type": "text",
+                    "text": f"[Attached spreadsheet: {filename} — could not be parsed]",
+                })
             continue
 
         raw = file_path.read_bytes()
@@ -260,25 +279,33 @@ async def chat(
     # AssistantMessages whose text wasn't streamed (e.g. post-tool turns).
     streamed_len_before_msg = 0
 
-    # Set up a validation queue so the capture_metadata tool can push
-    # validation results back to us for streaming to the frontend.
+    # Set up an events queue so tool handlers (capture_metadata,
+    # render_artifact) can push results back to us for streaming.
     queue: asyncio.Queue = asyncio.Queue()
-    token = validation_events.set(queue)
+    token = stream_events.set(queue)
     last_capture_tool_use_id: str | None = None
+    last_render_tool_use_id: str | None = None
 
     try:
         async for message in query(prompt=_create_message_stream(prompt_content), options=options):
-            # Drain any pending validation results pushed by tool handlers.
-            # These arrive after the tool executes (between the tool_use
-            # AssistantMessage and the next text response).
+            # Drain any pending events pushed by tool handlers. These arrive
+            # after the tool executes (between the tool_use AssistantMessage
+            # and the next text response).
             while not queue.empty():
-                validation_dict = queue.get_nowait()
-                if last_capture_tool_use_id:
+                evt = queue.get_nowait()
+                kind = evt.get("kind")
+                if kind == "validation" and last_capture_tool_use_id:
                     yield {"tool_result": {
                         "tool_use_id": last_capture_tool_use_id,
-                        "validation": validation_dict,
+                        "validation": evt.get("data"),
                     }}
                     last_capture_tool_use_id = None
+                elif kind == "artifact":
+                    yield {"artifact": {
+                        **evt.get("artifact", {}),
+                        "tool_use_id": last_render_tool_use_id,
+                    }}
+                    last_render_tool_use_id = None
 
             if isinstance(message, StreamEvent):
                 event = message.event
@@ -294,6 +321,8 @@ async def chat(
                         tool_id = block.get("id", "")
                         if "capture_metadata" in tool_name:
                             last_capture_tool_use_id = tool_id
+                        elif "render_artifact" in tool_name:
+                            last_render_tool_use_id = tool_id
                         yield {"tool_use_start": {"name": tool_name, "id": tool_id}}
 
                 elif event_type == "content_block_delta":
@@ -347,7 +376,7 @@ async def chat(
         full_response.append(error_msg)
         yield {"content": error_msg}
     finally:
-        validation_events.reset(token)
+        stream_events.reset(token)
 
     # Save the assistant's complete response
     assistant_text = "".join(full_response)

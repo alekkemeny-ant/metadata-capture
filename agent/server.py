@@ -14,11 +14,12 @@ from pydantic import BaseModel
 
 from .db.database import close_db, init_db
 from .service import AVAILABLE_MODELS, DEFAULT_MODEL, chat, get_session_messages, get_sessions
+from .tools.spreadsheet import SPREADSHEET_CONTENT_TYPES, parse_spreadsheet
 
 UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
 ALLOWED_CONTENT_TYPES = {
     "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf",
-}
+} | SPREADSHEET_CONTENT_TYPES
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
 
 # Load environment variables from .env file
@@ -251,11 +252,19 @@ async def upload_file(file: UploadFile, session_id: str | None = None):
     """Upload a file (image or PDF) for use in chat messages."""
     from .tools.metadata_store import save_upload
 
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. Allowed: {', '.join(sorted(ALLOWED_CONTENT_TYPES))}",
-        )
+    # Some OSes report .csv as text/plain; fall back to extension sniffing
+    content_type = file.content_type or ""
+    if content_type not in ALLOWED_CONTENT_TYPES:
+        fname_lower = (file.filename or "").lower()
+        if fname_lower.endswith(".csv"):
+            content_type = "text/csv"
+        elif fname_lower.endswith(".xlsx"):
+            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file.content_type}. Allowed: {', '.join(sorted(ALLOWED_CONTENT_TYPES))}",
+            )
 
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_SIZE:
@@ -270,7 +279,7 @@ async def upload_file(file: UploadFile, session_id: str | None = None):
     return await save_upload(
         upload_id=file_id,
         original_filename=file.filename or "unknown",
-        content_type=file.content_type or "application/octet-stream",
+        content_type=content_type,
         file_path=str(dest),
         size_bytes=len(contents),
         session_id=session_id,
@@ -295,6 +304,58 @@ async def get_uploaded_file(file_id: str):
         media_type=upload["content_type"],
         filename=upload["original_filename"],
     )
+
+
+@app.get("/uploads/{file_id}/table")
+async def get_upload_as_table(file_id: str) -> dict[str, Any]:
+    """Parse a spreadsheet upload (CSV/XLSX) into columns + rows."""
+    from .tools.metadata_store import get_upload
+
+    upload = await get_upload(file_id)
+    if upload is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    content_type = upload["content_type"]
+    if content_type not in SPREADSHEET_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Upload is not a spreadsheet")
+
+    file_path = Path(upload["file_path"])
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    try:
+        parsed = parse_spreadsheet(file_path, content_type)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to parse spreadsheet: {exc}")
+
+    return {
+        **parsed,
+        "filename": upload["original_filename"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Artifact endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/artifacts/{artifact_id}")
+async def get_artifact_endpoint(artifact_id: str) -> dict[str, Any]:
+    """Fetch a single artifact by ID."""
+    from .tools.metadata_store import get_artifact
+
+    artifact = await get_artifact(artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return artifact
+
+
+@app.get("/sessions/{session_id}/artifacts")
+async def list_session_artifacts(session_id: str) -> list[dict[str, Any]]:
+    """List all artifacts for a session."""
+    from .tools.metadata_store import list_artifacts
+
+    return await list_artifacts(session_id)
 
 
 # ---------------------------------------------------------------------------

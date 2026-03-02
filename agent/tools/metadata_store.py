@@ -402,3 +402,56 @@ async def get_upload(upload_id: str) -> dict[str, Any] | None:
     cursor = await db.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,))
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Artifact management
+# ---------------------------------------------------------------------------
+
+async def create_artifact(
+    session_id: str,
+    artifact_type: str,
+    title: str,
+    content: Any,
+    language: str | None = None,
+) -> dict[str, Any]:
+    """Persist an agent-generated artifact. Returns the created artifact."""
+    db = await get_db()
+    artifact_id = str(uuid.uuid4())
+    await db.execute(
+        """INSERT INTO artifacts (id, session_id, artifact_type, title, content_json, language)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (artifact_id, session_id, artifact_type, title, _serialize(content), language),
+    )
+    await db.commit()
+    created = await get_artifact(artifact_id)
+    assert created is not None
+    return created
+
+
+async def get_artifact(artifact_id: str) -> dict[str, Any] | None:
+    """Fetch a single artifact by ID, with content parsed from JSON."""
+    db = await get_db()
+    cursor = await db.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["content"] = _parse_json(d.pop("content_json", None))
+    return d
+
+
+async def list_artifacts(session_id: str) -> list[dict[str, Any]]:
+    """List all artifacts for a session, newest first."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at DESC",
+        (session_id,),
+    )
+    rows = await cursor.fetchall()
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["content"] = _parse_json(d.pop("content_json", None))
+        result.append(d)
+    return result

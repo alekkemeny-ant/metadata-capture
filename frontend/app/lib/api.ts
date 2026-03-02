@@ -51,6 +51,24 @@ export interface UploadedFile {
   size: number;
 }
 
+export interface SpreadsheetData {
+  columns: string[];
+  rows: (string | number | null)[][];
+  total_rows: number;
+  sheet_name: string | null;
+  filename?: string;
+}
+
+export interface Artifact {
+  id: string;
+  session_id: string;
+  artifact_type: 'table' | 'json' | 'markdown' | 'code';
+  title: string;
+  content: unknown;
+  language?: string | null;
+  created_at: string;
+}
+
 export interface ModelInfo {
   models: string[];
   default: string;
@@ -82,6 +100,24 @@ export async function uploadFile(file: File, sessionId?: string): Promise<Upload
 
 export function getUploadUrl(fileId: string): string {
   return `${API_BASE}/uploads/${fileId}`;
+}
+
+export async function fetchUploadTable(fileId: string): Promise<SpreadsheetData> {
+  const res = await fetch(`${API_BASE}/uploads/${fileId}/table`);
+  if (!res.ok) throw new Error(`Failed to parse spreadsheet: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchArtifact(artifactId: string): Promise<Artifact> {
+  const res = await fetch(`${API_BASE}/artifacts/${artifactId}`);
+  if (!res.ok) throw new Error(`Failed to fetch artifact: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchSessionArtifacts(sessionId: string): Promise<Artifact[]> {
+  const res = await fetch(`${API_BASE}/sessions/${sessionId}/artifacts`);
+  if (!res.ok) throw new Error(`Failed to fetch artifacts: ${res.status}`);
+  return res.json();
 }
 
 export async function sendChatMessage(
@@ -140,7 +176,7 @@ export async function sendChatMessage(
             // Forward any content-bearing event to the chunk handler
             if (parsed.content || parsed.thinking_start || parsed.thinking ||
                 parsed.tool_use_start || parsed.tool_use_input || parsed.block_stop ||
-                parsed.tool_result) {
+                parsed.tool_result || parsed.artifact) {
               onChunk(parsed);
             }
           } catch {

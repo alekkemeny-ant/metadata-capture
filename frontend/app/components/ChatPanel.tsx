@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { sendChatMessage, fetchMessages, fetchModels, uploadFile, getUploadUrl, ChatMessage, MessageAttachment } from '../lib/api';
+import ArtifactModal, { ArtifactSource } from './ArtifactModal';
 
 // ---------------------------------------------------------------------------
 // File attachment types
@@ -12,6 +13,17 @@ import { sendChatMessage, fetchMessages, fetchModels, uploadFile, getUploadUrl, 
 interface FileAttachment {
   file: File;
   preview?: string; // object URL for image preview
+}
+
+// Spreadsheet MIME types (match backend SPREADSHEET_CONTENT_TYPES)
+const SPREADSHEET_TYPES = new Set([
+  'text/csv',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+]);
+
+function isSpreadsheet(typeOrName: string): boolean {
+  return SPREADSHEET_TYPES.has(typeOrName) || typeOrName.toLowerCase().endsWith('.csv') || typeOrName.toLowerCase().endsWith('.xlsx');
 }
 
 // SpeechRecognition type shim for browsers that support it
@@ -56,12 +68,19 @@ interface ToolValidation {
   warnings: ValidationIssue[];
 }
 
+interface ArtifactRef {
+  id: string;
+  type: string;
+  title: string;
+}
+
 interface MessageBlock {
   type: 'text' | 'thinking' | 'tool_use';
   content: string;
   name?: string;       // tool name, only for tool_use
   toolUseId?: string;  // tool use ID, for matching results
   validation?: ToolValidation; // validation result from capture_metadata
+  artifact?: ArtifactRef;      // artifact rendered by this tool_use
 }
 
 interface StructuredMessage {
@@ -111,13 +130,18 @@ const TOOL_STATUS_LABELS: Record<string, { active: string; done: string }> = {
   capture_metadata: { active: 'Extracting metadata...', done: 'Metadata captured' },
   validate_metadata: { active: 'Validating metadata...', done: 'Validation complete' },
   registry_lookup: { active: 'Checking external registry...', done: 'Registry lookup complete' },
+  find_records: { active: 'Searching records...', done: 'Records found' },
+  link_records: { active: 'Linking records...', done: 'Records linked' },
+  render_artifact: { active: 'Creating artifact...', done: 'Artifact created' },
 };
 
 function getToolLabel(name: string, active: boolean): string {
-  const labels = TOOL_STATUS_LABELS[name];
+  // Strip MCP prefix (e.g., mcp__capture__render_artifact -> render_artifact)
+  const bare = name.replace(/^mcp__[^_]+__/, '');
+  const labels = TOOL_STATUS_LABELS[bare] || TOOL_STATUS_LABELS[name];
   if (labels) return active ? labels.active : labels.done;
   // Fallback: humanize the tool name
-  const humanized = name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ');
+  const humanized = bare.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ');
   return active ? `Running ${humanized}...` : `${humanized} done`;
 }
 
@@ -159,7 +183,31 @@ function ValidationBadges({ validation }: { validation: ToolValidation }) {
   );
 }
 
-function ToolUseBlock({ name, content, isStreaming, validation }: { name: string; content: string; isStreaming?: boolean; validation?: ToolValidation }) {
+function ArtifactChip({ artifact, onOpen }: { artifact: ArtifactRef; onOpen: () => void }) {
+  return (
+    <button
+      onClick={onOpen}
+      className="flex items-center gap-2 px-3 py-2 mt-1.5 rounded-lg border border-brand-fig/20 bg-brand-magenta-100/30 hover:bg-brand-magenta-100/60 transition-colors text-left w-full"
+    >
+      <svg className="w-4 h-4 text-brand-fig shrink-0" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25A2.25 2.25 0 015.25 3h13.5A2.25 2.25 0 0121 5.25z" />
+      </svg>
+      <span className="flex-1 text-xs font-medium text-sand-700 truncate">{artifact.title}</span>
+      <span className="px-1.5 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide bg-brand-fig/10 text-brand-fig">
+        {artifact.type}
+      </span>
+    </button>
+  );
+}
+
+function ToolUseBlock({ name, content, isStreaming, validation, artifact, onOpenArtifact }: {
+  name: string;
+  content: string;
+  isStreaming?: boolean;
+  validation?: ToolValidation;
+  artifact?: ArtifactRef;
+  onOpenArtifact?: (ref: ArtifactRef) => void;
+}) {
   const hasIssues = validation && (validation.errors.length > 0 || validation.warnings.length > 0);
   const [manualExpand, setManualExpand] = useState<boolean | null>(null);
   // Auto-expand while streaming, or if there are validation issues; manual toggle overrides
@@ -217,6 +265,11 @@ function ToolUseBlock({ name, content, isStreaming, validation }: { name: string
       {expanded && prettyInput && (
         <div className="px-3 py-2 text-xs font-mono text-sand-600 border-t border-sand-100 max-h-64 overflow-y-auto whitespace-pre-wrap bg-sand-50">
           {prettyInput}
+        </div>
+      )}
+      {artifact && onOpenArtifact && (
+        <div className="px-2 pb-2">
+          <ArtifactChip artifact={artifact} onOpen={() => onOpenArtifact(artifact)} />
         </div>
       )}
     </div>
@@ -277,6 +330,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
   const [pendingFiles, setPendingFiles] = useState<FileAttachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [openArtifact, setOpenArtifact] = useState<ArtifactSource | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -333,7 +387,8 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
     const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf'];
     const newAttachments: FileAttachment[] = [];
     for (const file of Array.from(files)) {
-      if (!allowed.includes(file.type)) continue;
+      const ok = allowed.includes(file.type) || isSpreadsheet(file.type) || isSpreadsheet(file.name);
+      if (!ok) continue;
       if (file.size > 20 * 1024 * 1024) continue;
       const preview = file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined;
       newAttachments.push({ file, preview });
@@ -525,10 +580,24 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
             }
           } else if (event.tool_result) {
             const result = event.tool_result as { tool_use_id: string; validation: ToolValidation };
-            // Attach validation to the matching tool_use block
             const idx = blocks.findIndex(b => b.type === 'tool_use' && b.toolUseId === result.tool_use_id);
             if (idx !== -1) {
               blocks[idx] = { ...blocks[idx], validation: result.validation };
+            }
+          } else if (event.artifact) {
+            const art = event.artifact as { id: string; type: string; title: string; tool_use_id?: string | null };
+            const ref: ArtifactRef = { id: art.id, type: art.type, title: art.title };
+            // Attach to the matching tool_use block; fall back to the last tool_use block
+            let idx = art.tool_use_id
+              ? blocks.findIndex(b => b.type === 'tool_use' && b.toolUseId === art.tool_use_id)
+              : -1;
+            if (idx === -1) {
+              for (let k = blocks.length - 1; k >= 0; k--) {
+                if (blocks[k].type === 'tool_use') { idx = k; break; }
+              }
+            }
+            if (idx !== -1) {
+              blocks[idx] = { ...blocks[idx], artifact: ref };
             }
           }
           // block_stop: no state change needed — next delta auto-starts a new block
@@ -639,6 +708,8 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
                               content={block.content}
                               isStreaming={isStreaming && i === messages.length - 1 && idx === msg.blocks!.length - 1}
                               validation={block.validation}
+                              artifact={block.artifact}
+                              onOpenArtifact={(ref) => setOpenArtifact({ type: 'artifact', id: ref.id })}
                             />
                           ) : null
                         )}
@@ -650,24 +721,42 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
                     <>
                       {msg.attachments && msg.attachments.length > 0 && (
                         <div className="flex flex-wrap gap-2 mb-2">
-                          {msg.attachments.map((att, ai) =>
-                            att.content_type.startsWith('image/') ? (
-                              <a key={ai} href={getUploadUrl(att.file_id)} target="_blank" rel="noopener noreferrer">
-                                <img
-                                  src={getUploadUrl(att.file_id)}
-                                  alt={att.filename}
-                                  className="max-w-[200px] max-h-[150px] rounded-lg object-cover border border-white/30"
-                                />
-                              </a>
-                            ) : (
+                          {msg.attachments.map((att, ai) => {
+                            if (att.content_type.startsWith('image/')) {
+                              return (
+                                <a key={ai} href={getUploadUrl(att.file_id)} target="_blank" rel="noopener noreferrer">
+                                  <img
+                                    src={getUploadUrl(att.file_id)}
+                                    alt={att.filename}
+                                    className="max-w-[200px] max-h-[150px] rounded-lg object-cover border border-white/30"
+                                  />
+                                </a>
+                              );
+                            }
+                            if (isSpreadsheet(att.content_type) || isSpreadsheet(att.filename)) {
+                              return (
+                                <button
+                                  key={ai}
+                                  onClick={() => setOpenArtifact({ type: 'upload', id: att.file_id })}
+                                  className="flex items-center gap-1.5 bg-white/20 hover:bg-white/30 rounded-lg px-3 py-1.5 text-xs transition-colors"
+                                  title="View spreadsheet"
+                                >
+                                  <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3.375 19.5h17.25m-17.25 0a1.125 1.125 0 01-1.125-1.125M3.375 19.5h7.5c.621 0 1.125-.504 1.125-1.125m-9.75 0V5.625m0 12.75v-1.5c0-.621.504-1.125 1.125-1.125m18.375 2.625V5.625m0 12.75c0 .621-.504 1.125-1.125 1.125m1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125m0 0h-7.5m-9 0h9m-9 0a1.125 1.125 0 00-1.125 1.125M12 18.375v-1.5m0 1.5c0 .621.504 1.125 1.125 1.125M12 18.375a1.125 1.125 0 01-1.125 1.125M3.375 5.625c0-.621.504-1.125 1.125-1.125h15c.621 0 1.125.504 1.125 1.125m-17.25 0V9.75c0 .621.504 1.125 1.125 1.125h15c.621 0 1.125-.504 1.125-1.125V5.625m-17.25 0h17.25" />
+                                  </svg>
+                                  {att.filename}
+                                </button>
+                              );
+                            }
+                            return (
                               <div key={ai} className="flex items-center gap-1.5 bg-white/20 rounded-lg px-3 py-1.5 text-xs">
                                 <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
                                 </svg>
                                 {att.filename}
                               </div>
-                            )
-                          )}
+                            );
+                          })}
                         </div>
                       )}
                       <p className="whitespace-pre-wrap">{msg.content}</p>
@@ -705,9 +794,15 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
                     <img src={att.preview} alt={att.file.name} className="w-16 h-16 rounded-lg object-cover border border-sand-200" />
                   ) : (
                     <div className="w-16 h-16 rounded-lg border border-sand-200 bg-sand-50 flex flex-col items-center justify-center">
-                      <svg className="w-5 h-5 text-sand-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-                      </svg>
+                      {isSpreadsheet(att.file.type) || isSpreadsheet(att.file.name) ? (
+                        <svg className="w-5 h-5 text-brand-aqua-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3.375 19.5h17.25m-17.25 0a1.125 1.125 0 01-1.125-1.125M3.375 19.5h7.5c.621 0 1.125-.504 1.125-1.125m-9.75 0V5.625m0 12.75v-1.5c0-.621.504-1.125 1.125-1.125m18.375 2.625V5.625m0 12.75c0 .621-.504 1.125-1.125 1.125m1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125m0 0h-7.5m-9 0h9m-9 0a1.125 1.125 0 00-1.125 1.125M12 18.375v-1.5m0 1.5c0 .621.504 1.125 1.125 1.125M12 18.375a1.125 1.125 0 01-1.125 1.125M3.375 5.625c0-.621.504-1.125 1.125-1.125h15c.621 0 1.125.504 1.125 1.125m-17.25 0V9.75c0 .621.504 1.125 1.125 1.125h15c.621 0 1.125-.504 1.125-1.125V5.625m-17.25 0h17.25" />
+                        </svg>
+                      ) : (
+                        <svg className="w-5 h-5 text-sand-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                        </svg>
+                      )}
                       <span className="text-[9px] text-sand-500 mt-0.5 truncate max-w-[56px] px-1">{att.file.name}</span>
                     </div>
                   )}
@@ -727,7 +822,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
             ref={fileInputRef}
             type="file"
             multiple
-            accept="image/png,image/jpeg,image/gif,image/webp,application/pdf"
+            accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,.csv,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             className="hidden"
             onChange={(e) => {
               if (e.target.files?.length) addFiles(e.target.files);
@@ -783,7 +878,7 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
                 className="w-9 h-9 rounded-xl border border-sand-200
                            flex items-center justify-center text-sand-400
                            hover:text-sand-600 hover:bg-sand-50 transition-colors"
-                title="Attach image or PDF"
+                title="Attach image, PDF, or spreadsheet"
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13" />
@@ -835,6 +930,8 @@ export default function ChatPanel({ sessionId, onSessionChange }: ChatPanelProps
           </div>
         </div>
       </div>
+
+      <ArtifactModal source={openArtifact} onClose={() => setOpenArtifact(null)} />
     </div>
   );
 }
