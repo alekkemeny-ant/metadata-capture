@@ -1,4 +1,4 @@
-"""SQL table definitions for the metadata capture system."""
+"""SQL table definitions for the metadata capture system (PostgreSQL)."""
 
 METADATA_RECORDS_TABLE = """
 CREATE TABLE IF NOT EXISTS metadata_records (
@@ -17,29 +17,29 @@ CREATE TABLE IF NOT EXISTS metadata_records (
     status TEXT NOT NULL DEFAULT 'draft'
         CHECK (status IN ('draft', 'validated', 'confirmed', 'error')),
     validation_json TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')::TEXT,
+    updated_at TEXT NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')::TEXT
 );
 """
 
 RECORD_LINKS_TABLE = """
 CREATE TABLE IF NOT EXISTS record_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     source_id TEXT NOT NULL REFERENCES metadata_records(id) ON DELETE CASCADE,
     target_id TEXT NOT NULL REFERENCES metadata_records(id) ON DELETE CASCADE,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')::TEXT,
     UNIQUE(source_id, target_id)
 );
 """
 
 CONVERSATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     session_id TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content TEXT NOT NULL,
     attachments_json TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')::TEXT
 );
 """
 
@@ -51,27 +51,23 @@ CREATE TABLE IF NOT EXISTS uploads (
     file_path TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     session_id TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')::TEXT
 );
 """
 
-CREATE_INDEXES = """
-CREATE INDEX IF NOT EXISTS idx_records_session ON metadata_records(session_id);
-CREATE INDEX IF NOT EXISTS idx_records_type ON metadata_records(record_type);
-CREATE INDEX IF NOT EXISTS idx_records_category ON metadata_records(category);
-CREATE INDEX IF NOT EXISTS idx_records_status ON metadata_records(status);
-CREATE INDEX IF NOT EXISTS idx_links_source ON record_links(source_id);
-CREATE INDEX IF NOT EXISTS idx_links_target ON record_links(target_id);
-CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id);
-"""
+CREATE_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_records_session ON metadata_records(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_records_type ON metadata_records(record_type)",
+    "CREATE INDEX IF NOT EXISTS idx_records_category ON metadata_records(category)",
+    "CREATE INDEX IF NOT EXISTS idx_records_status ON metadata_records(status)",
+    "CREATE INDEX IF NOT EXISTS idx_links_source ON record_links(source_id)",
+    "CREATE INDEX IF NOT EXISTS idx_links_target ON record_links(target_id)",
+    "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_uploads_session ON uploads(session_id)",
+]
 
-CREATE_INDEXES_UPLOADS = """
-CREATE INDEX IF NOT EXISTS idx_uploads_session ON uploads(session_id);
-"""
+ALL_TABLES = [METADATA_RECORDS_TABLE, RECORD_LINKS_TABLE, CONVERSATIONS_TABLE, UPLOADS_TABLE]
 
-ALL_TABLES = [METADATA_RECORDS_TABLE, RECORD_LINKS_TABLE, CONVERSATIONS_TABLE, UPLOADS_TABLE, CREATE_INDEXES, CREATE_INDEXES_UPLOADS]
-
-# Category mapping: record_type -> category
 CATEGORY_MAP = {
     "subject": "shared",
     "procedures": "shared",

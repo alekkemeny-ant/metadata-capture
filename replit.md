@@ -6,7 +6,7 @@ A real-time metadata capture and validation platform for AIND (Allen Institute f
 ## Architecture
 - **Frontend**: Next.js 14 + TypeScript + Tailwind CSS (port 5000)
 - **Backend**: FastAPI Python API wrapping Claude Agent SDK (port 8001, localhost only)
-- **Database**: Local SQLite via aiosqlite (WAL mode)
+- **Database**: Replit PostgreSQL via asyncpg (connection pool)
 - **MCP**: aind-metadata-mcp server (21 tools for AIND DB access)
 
 ## Project Structure
@@ -17,7 +17,7 @@ workspace/
 │   ├── run.py           # Uvicorn entry point (port 8001)
 │   ├── service.py       # Core agent logic
 │   ├── validation.py    # Schema validation
-│   ├── db/              # SQLite database layer
+│   ├── db/              # PostgreSQL database layer
 │   ├── prompts/         # System prompts
 │   └── tools/           # MCP tools (metadata_store, capture, registry)
 ├── frontend/            # Next.js frontend (port 5000)
@@ -47,8 +47,19 @@ workspace/
 - API calls proxied via Next.js rewrites (no direct backend access from browser)
 - API_BASE in frontend defaults to empty string (uses same origin + rewrites)
 - ANTHROPIC_API_KEY must be set as a Replit secret
+- DATABASE_URL is set automatically by Replit's PostgreSQL provisioning
 
 ## Recent Changes
+- 2026-03-04: Migrated from SQLite to Replit PostgreSQL
+  - Replaced aiosqlite with asyncpg (connection pool, min=2, max=10)
+  - Converted all SQL queries from `?` placeholders to `$1, $2, ...` (PostgreSQL syntax)
+  - Tables: metadata_records, record_links, conversations, uploads
+  - Database connection via DATABASE_URL environment variable
+  - Added /artifacts rewrite to Next.js config
+- 2026-02-27: Added offline chat protection
+  - Health check state lifted to page.tsx, passed as prop to Header and ChatPanel
+  - Chat input disabled with "Agent is starting up..." overlay when agent offline
+  - Deployment set to autoscale (cold start ~60s)
 - 2026-02-24: Configured for Replit environment
   - Set Next.js to port 5000 with all hosts allowed
   - Set backend to localhost:8001

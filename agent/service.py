@@ -366,8 +366,8 @@ async def get_sessions() -> list[dict[str, Any]]:
     """Get all sessions with their message counts."""
     from .db.database import get_db
 
-    db = await get_db()
-    cursor = await db.execute(
+    pool = await get_db()
+    rows = await pool.fetch(
         """
         SELECT
             session_id,
@@ -386,5 +386,4 @@ async def get_sessions() -> list[dict[str, Any]]:
         ORDER BY MAX(created_at) DESC
         """
     )
-    rows = await cursor.fetchall()
     return [dict(r) for r in rows]

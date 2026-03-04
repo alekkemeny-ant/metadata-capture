@@ -1,46 +1,49 @@
-"""Async SQLite database setup for the metadata capture system."""
+"""Async PostgreSQL database setup for the metadata capture system."""
 
 import os
-from pathlib import Path
+import logging
 
-import aiosqlite
+import asyncpg
 
-from .models import ALL_TABLES
+from .models import ALL_TABLES, CREATE_INDEXES
 
-DB_DIR = Path(os.environ.get("METADATA_DB_DIR", Path(__file__).resolve().parent.parent))
-DB_PATH = DB_DIR / "metadata.db"
+logger = logging.getLogger(__name__)
 
-_db_connection: aiosqlite.Connection | None = None
+_pool: asyncpg.Pool | None = None
 
 
-async def get_db() -> aiosqlite.Connection:
-    """Return the shared database connection, creating it if needed."""
-    global _db_connection
-    if _db_connection is None:
-        DB_DIR.mkdir(parents=True, exist_ok=True)
-        _db_connection = await aiosqlite.connect(str(DB_PATH))
-        _db_connection.row_factory = aiosqlite.Row
-        await _db_connection.execute("PRAGMA journal_mode=WAL")
-        await _db_connection.execute("PRAGMA foreign_keys=ON")
-    return _db_connection
+async def get_pool() -> asyncpg.Pool:
+    """Return the shared connection pool, creating it if needed."""
+    global _pool
+    if _pool is None:
+        database_url = os.environ.get("DATABASE_URL")
+        if not database_url:
+            raise RuntimeError("DATABASE_URL environment variable is not set")
+        _pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
+        logger.info("PostgreSQL connection pool created")
+    return _pool
+
+
+async def get_db() -> asyncpg.Pool:
+    """Return the shared connection pool (alias for get_pool)."""
+    return await get_pool()
 
 
 async def init_db() -> None:
-    """Initialize the database tables."""
-    db = await get_db()
-    for ddl in ALL_TABLES:
-        await db.executescript(ddl)
-    # Migrate: add attachments_json to conversations if missing
-    cursor = await db.execute("PRAGMA table_info(conversations)")
-    cols = {row[1] for row in await cursor.fetchall()}
-    if "attachments_json" not in cols:
-        await db.execute("ALTER TABLE conversations ADD COLUMN attachments_json TEXT")
-    await db.commit()
+    """Initialize the database tables and indexes."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        for ddl in ALL_TABLES:
+            await conn.execute(ddl)
+        for idx_ddl in CREATE_INDEXES:
+            await conn.execute(idx_ddl)
+    logger.info("Database tables initialized")
 
 
 async def close_db() -> None:
-    """Close the database connection."""
-    global _db_connection
-    if _db_connection is not None:
-        await _db_connection.close()
-        _db_connection = None
+    """Close the database connection pool."""
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
+        logger.info("PostgreSQL connection pool closed")
