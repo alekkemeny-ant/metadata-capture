@@ -1,5 +1,6 @@
 """FastAPI HTTP server wrapping the metadata capture agent service."""
 
+import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
@@ -83,9 +84,35 @@ async def chat_endpoint(req: ChatRequest):
     attachments = [a.model_dump() for a in req.attachments] if req.attachments else None
 
     async def event_stream():
-        async for chunk in chat(session_id, req.message, model=req.model, attachments=attachments):
-            yield f"data: {json.dumps(chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        async def _produce():
+            try:
+                async for chunk in chat(session_id, req.message, model=req.model, attachments=attachments):
+                    await queue.put(f"data: {json.dumps(chunk)}\n\n")
+                await queue.put("data: [DONE]\n\n")
+            except Exception as exc:
+                await queue.put(f"data: {json.dumps({'error': str(exc)})}\n\n")
+            finally:
+                await queue.put(None)
+
+        producer = asyncio.create_task(_produce())
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if item is None:
+                    break
+                yield item
+        finally:
+            producer.cancel()
+            try:
+                await producer
+            except (asyncio.CancelledError, Exception):
+                pass
 
     return StreamingResponse(
         event_stream(),
