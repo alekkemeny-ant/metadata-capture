@@ -16,6 +16,7 @@ const nextConfig = {
       { source: '/upload', destination: 'http://localhost:8001/upload' },
       { source: '/uploads/:path*', destination: 'http://localhost:8001/uploads/:path*' },
       { source: '/artifacts/:path*', destination: 'http://localhost:8001/artifacts/:path*' },
+      { source: '/schema/:path*', destination: 'http://localhost:8001/schema/:path*' },
     ];
   },
   async headers() {
