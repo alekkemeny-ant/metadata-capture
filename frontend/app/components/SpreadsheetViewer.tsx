@@ -5,11 +5,22 @@ interface SpreadsheetViewerProps {
   rows: (string | number | null)[][];
   totalRows?: number;
   sheetName?: string | null;
+  // Edit-mode props — all optional. Absence → current read-only behavior.
+  // Wired up in Stage 3; present here so ArtifactModal compiles.
+  recordIdColumn?: number;
+  enums?: Record<string, string[]>;
+  missingRows?: Set<number>;
+  onCellCommit?: (recordId: string, column: string, value: string) => Promise<void>;
 }
 
 // Plain <table> renderer. No virtualization — fine for ~2000 rows.
 // Swap in react-window later if large-file perf becomes a concern.
-export default function SpreadsheetViewer({ columns, rows, totalRows, sheetName }: SpreadsheetViewerProps) {
+export default function SpreadsheetViewer({
+  columns, rows, totalRows, sheetName,
+  // Edit props — unused until Stage 3 lands, but accepted so callers compile.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  recordIdColumn, enums, missingRows, onCellCommit,
+}: SpreadsheetViewerProps) {
   const shownRows = rows.length;
   const truncated = typeof totalRows === 'number' && totalRows > shownRows ? totalRows - shownRows : 0;
 

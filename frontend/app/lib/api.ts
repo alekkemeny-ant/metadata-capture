@@ -245,6 +245,52 @@ export async function updateRecordData(recordId: string, data: Record<string, un
   return res.json();
 }
 
+export interface SchemaEnums {
+  species: string[];
+  sex: string[];
+}
+
+export async function fetchSchemaEnums(): Promise<SchemaEnums> {
+  const res = await fetch(`${API_BASE}/schema/enums`);
+  if (!res.ok) throw new Error(`Failed to fetch enums: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Single-field update with server-side shape mapping. Unlike updateRecordData,
+ * this knows that `species` is a nested dict and reconstructs it correctly,
+ * and it rejects unknown fields with 400 instead of warn-and-storing them.
+ */
+export async function patchRecordField(
+  recordId: string,
+  field: string,
+  value: string,
+): Promise<MetadataRecord> {
+  const res = await fetch(`${API_BASE}/records/${recordId}/field`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ field, value }),
+  });
+  if (!res.ok) {
+    // FastAPI HTTPException detail is in {detail: "..."}; surface it so the
+    // cell can show "Unknown field 'genotype_string'" instead of a code.
+    let detail = `Update failed: ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch { /* non-JSON body */ }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+export async function fetchRecordsByIds(ids: string[]): Promise<MetadataRecord[]> {
+  if (ids.length === 0) return [];
+  const res = await fetch(`${API_BASE}/records?ids=${encodeURIComponent(ids.join(','))}`);
+  if (!res.ok) throw new Error(`Failed to fetch records: ${res.status}`);
+  return res.json();
+}
+
 export async function confirmRecord(recordId: string): Promise<MetadataRecord> {
   const res = await fetch(`${API_BASE}/records/${recordId}/confirm`, { method: 'POST' });
   if (!res.ok) throw new Error(`Failed to confirm record: ${res.status}`);

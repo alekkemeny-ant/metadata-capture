@@ -1,10 +1,20 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import SpreadsheetViewer from './SpreadsheetViewer';
-import { fetchArtifact, fetchUploadTable, Artifact, SpreadsheetData } from '../lib/api';
+import {
+  fetchArtifact,
+  fetchRecordsByIds,
+  fetchSchemaEnums,
+  fetchUploadTable,
+  patchRecordField,
+  Artifact,
+  MetadataRecord,
+  SchemaEnums,
+  SpreadsheetData,
+} from '../lib/api';
 
 export type ArtifactSource = { type: 'upload'; id: string } | { type: 'artifact'; id: string };
 
@@ -30,11 +40,60 @@ function TypeBadge({ type }: { type: string }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Editable-table state. Only populated when a `table` artifact has a
+// `record_id` column — that's the convention signalling it was rendered from
+// metadata records and edits should write back to them.
+// ---------------------------------------------------------------------------
+
+interface EditState {
+  recordIdColumn: number;
+  enums: SchemaEnums;
+  missingRows: Set<number>;
+  // Live record data overlaid onto the snapshot. Keyed by record_id.
+  // When a cell commits, we update this map and re-derive the overlay rows.
+  liveData: Map<string, Record<string, unknown>>;
+}
+
+type TableContent = { columns: string[]; rows: (string | number | null)[][] };
+
+/** Flatten a data_json value to its display string. species is {name,...} → name. */
+function flattenForDisplay(value: unknown): string | number | null {
+  if (value == null) return null;
+  if (typeof value === 'object') {
+    const v = value as Record<string, unknown>;
+    if (typeof v.name === 'string') return v.name;
+    if (typeof v.abbreviation === 'string') return v.abbreviation;
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'string' || typeof value === 'number') return value;
+  return String(value);
+}
+
+/** Build the overlay: for each row, replace cells with live data where we have it. */
+function overlayRows(
+  table: TableContent,
+  recordIdColumn: number,
+  liveData: Map<string, Record<string, unknown>>,
+): (string | number | null)[][] {
+  return table.rows.map((row) => {
+    const rid = String(row[recordIdColumn] ?? '');
+    const live = liveData.get(rid);
+    if (!live) return row; // snapshot fallback (missing record, or not fetched yet)
+    return table.columns.map((col, ci) => {
+      if (ci === recordIdColumn) return row[ci];
+      const liveVal = live[col];
+      return liveVal !== undefined ? flattenForDisplay(liveVal) : row[ci];
+    });
+  });
+}
+
 export default function ArtifactModal({ source, onClose }: ArtifactModalProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [sheet, setSheet] = useState<SpreadsheetData | null>(null);
+  const [editState, setEditState] = useState<EditState | null>(null);
 
   // Escape to close
   useEffect(() => {
@@ -51,6 +110,7 @@ export default function ArtifactModal({ source, onClose }: ArtifactModalProps) {
     if (!source) {
       setArtifact(null);
       setSheet(null);
+      setEditState(null);
       setError(null);
       return;
     }
@@ -58,19 +118,76 @@ export default function ArtifactModal({ source, onClose }: ArtifactModalProps) {
     setError(null);
     setArtifact(null);
     setSheet(null);
+    setEditState(null);
 
     const load = async () => {
       if (source.type === 'upload') {
         setSheet(await fetchUploadTable(source.id));
-      } else {
-        setArtifact(await fetchArtifact(source.id));
+        return;
       }
+
+      const art = await fetchArtifact(source.id);
+      setArtifact(art);
+
+      // If this is a table rendered from metadata records (agent included a
+      // record_id column per the render_artifact convention), set up editing:
+      // batch-fetch live records and overlay them onto the snapshot so the
+      // user sees current truth, and edits write back via PATCH.
+      if (art.artifact_type !== 'table') return;
+      const table = art.content as TableContent;
+      if (!Array.isArray(table?.columns)) return;
+
+      const recordIdColumn = table.columns.findIndex(
+        (c) => c.toLowerCase() === 'record_id',
+      );
+      if (recordIdColumn === -1) return; // no binding → stays read-only
+
+      const ids = Array.from(
+        new Set(
+          table.rows
+            .map((r) => String(r[recordIdColumn] ?? '').trim())
+            .filter(Boolean),
+        ),
+      );
+
+      const [enums, records] = await Promise.all([
+        fetchSchemaEnums(),
+        fetchRecordsByIds(ids),
+      ]);
+
+      const liveData = new Map<string, Record<string, unknown>>(
+        records.map((r: MetadataRecord) => [r.id, r.data_json]),
+      );
+      const missingRows = new Set<number>(
+        table.rows
+          .map((r, i) => (liveData.has(String(r[recordIdColumn] ?? '')) ? -1 : i))
+          .filter((i) => i >= 0),
+      );
+
+      setEditState({ recordIdColumn, enums, missingRows, liveData });
     };
 
     load()
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false));
   }, [source]);
+
+  // Cell commit: PATCH the record, then refresh the overlay map so the cell
+  // immediately reflects the new value (and any other fields the backend
+  // touched, e.g. species registry enrichment). Throws on failure — the
+  // EditableCell catches it and stays in edit mode showing the message.
+  const handleCellCommit = useCallback(
+    async (recordId: string, column: string, value: string) => {
+      const updated = await patchRecordField(recordId, column, value);
+      setEditState((prev) => {
+        if (!prev) return prev;
+        const next = new Map(prev.liveData);
+        next.set(recordId, updated.data_json);
+        return { ...prev, liveData: next };
+      });
+    },
+    [],
+  );
 
   if (!source) return null;
 
@@ -127,6 +244,28 @@ export default function ArtifactModal({ source, onClose }: ArtifactModalProps) {
               totalRows={sheet.total_rows}
               sheetName={sheet.sheet_name}
             />
+          ) : artifact?.artifact_type === 'table' ? (
+            (() => {
+              const table = artifact.content as TableContent;
+              const cols = table.columns || [];
+              const snapshot = table.rows || [];
+              // Overlay live record data if this table is record-bound.
+              // editState is null while the batch fetch is in flight (first
+              // ~50ms of modal open) — render the snapshot meanwhile.
+              const rows = editState
+                ? overlayRows({ columns: cols, rows: snapshot }, editState.recordIdColumn, editState.liveData)
+                : snapshot;
+              return (
+                <SpreadsheetViewer
+                  columns={cols}
+                  rows={rows}
+                  recordIdColumn={editState?.recordIdColumn}
+                  enums={editState ? (editState.enums as unknown as Record<string, string[]>) : undefined}
+                  missingRows={editState?.missingRows}
+                  onCellCommit={editState ? handleCellCommit : undefined}
+                />
+              );
+            })()
           ) : artifact ? (
             <ArtifactBody artifact={artifact} />
           ) : null}
@@ -137,17 +276,8 @@ export default function ArtifactModal({ source, onClose }: ArtifactModalProps) {
 }
 
 function ArtifactBody({ artifact }: { artifact: Artifact }) {
+  // `table` is handled inline in ArtifactModal (needs editState + commit handler).
   const { artifact_type, content, language } = artifact;
-
-  if (artifact_type === 'table') {
-    const table = content as { columns?: string[]; rows?: (string | number | null)[][] };
-    return (
-      <SpreadsheetViewer
-        columns={table.columns || []}
-        rows={table.rows || []}
-      />
-    );
-  }
 
   if (artifact_type === 'json') {
     const pretty = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
