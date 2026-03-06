@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 // ---------------------------------------------------------------------------
 // Props
@@ -22,6 +22,8 @@ interface SpreadsheetViewerProps {
 
 const MIN_COL_WIDTH = 80;
 const DEFAULT_COL_WIDTH = 140;
+// Module-level so the default doesn't create a fresh {} every render and defeat Row's memo.
+const EMPTY_ENUMS: Record<string, string[]> = {};
 
 // ---------------------------------------------------------------------------
 // EditableCell — the edit state machine
@@ -45,7 +47,6 @@ interface EditableCellProps {
   isSelected: boolean;
   onSelect: () => void;
   onCommit?: (value: string) => Promise<void>;
-  widthPx: number;
 }
 
 export const EditableCell = memo(function EditableCell({
@@ -55,7 +56,6 @@ export const EditableCell = memo(function EditableCell({
   isSelected,
   onSelect,
   onCommit,
-  widthPx,
 }: EditableCellProps) {
   const display = value == null ? '' : String(value);
   const isNumeric = typeof value === 'number' || /^-?\d+(\.\d+)?$/.test(display);
@@ -151,19 +151,17 @@ export const EditableCell = memo(function EditableCell({
     }
   };
 
+  // No inline width style: tableLayout:fixed drives <td> widths from the <th> row.
   const baseTd =
     'px-3 py-1.5 border-b border-r border-sand-100 truncate relative ' +
     (isNumeric ? 'tabular-nums ' : '') +
     (isSelected ? 'outline outline-2 outline-brand-fig -outline-offset-1 bg-brand-magenta-100/30 ' : '');
-
-  const style = { width: `${widthPx}px`, minWidth: `${widthPx}px`, maxWidth: `${widthPx}px` };
 
   // --- Read-only mode --------------------------------------------------------
   if (mode === 'readonly') {
     return (
       <td
         className={baseTd + 'text-sand-400 cursor-cell'}
-        style={style}
         title={display}
         onClick={onSelect}
       >
@@ -175,7 +173,7 @@ export const EditableCell = memo(function EditableCell({
   // --- Enum mode — editing ---------------------------------------------------
   if (mode === 'enum' && isEditing && enumValues) {
     return (
-      <td className={baseTd + 'p-0'} style={style}>
+      <td className={baseTd + 'p-0'}>
         <select
           autoFocus
           value={draft}
@@ -203,7 +201,7 @@ export const EditableCell = memo(function EditableCell({
   // --- Text mode — editing ---------------------------------------------------
   if (isEditing) {
     return (
-      <td className={baseTd + 'p-0'} style={style}>
+      <td className={baseTd + 'p-0'}>
         <input
           autoFocus
           value={draft}
@@ -226,7 +224,6 @@ export const EditableCell = memo(function EditableCell({
   return (
     <td
       className={baseTd + 'cursor-cell'}
-      style={style}
       title={display}
       tabIndex={isSelected ? 0 : -1}
       onClick={handleClick}
@@ -264,7 +261,6 @@ interface RowProps {
   columns: string[];
   columnModes: CellMode[];
   enums: Record<string, string[]>;
-  colWidths: number[];
   selectedCol: number | null; // column selected in THIS row, else null
   isMissing: boolean;
   recordId: string | null;
@@ -273,7 +269,7 @@ interface RowProps {
 }
 
 const Row = memo(function Row({
-  rowIndex, row, columns, columnModes, enums, colWidths,
+  rowIndex, row, columns, columnModes, enums,
   selectedCol, isMissing, recordId, onSelect, onCommit,
 }: RowProps) {
   const bg = rowIndex % 2 === 0 ? 'bg-white' : 'bg-sand-50/50';
@@ -300,7 +296,6 @@ const Row = memo(function Row({
             isSelected={selectedCol === ci}
             onSelect={() => onSelect(rowIndex, ci)}
             onCommit={handleCommit}
-            widthPx={colWidths[ci]}
           />
         );
       })}
@@ -325,7 +320,7 @@ export default function SpreadsheetViewer({
   totalRows,
   sheetName,
   recordIdColumn,
-  enums = {},
+  enums = EMPTY_ENUMS,
   missingRows,
   onCellCommit,
 }: SpreadsheetViewerProps) {
@@ -383,15 +378,18 @@ export default function SpreadsheetViewer({
     [colWidths, handleResizeMove, handleResizeEnd],
   );
 
-  // Per-column mode — computed once per columns/enums change.
-  // recordIdColumn and unknown-enum columns are readonly; enum-matched are
-  // dropdowns; everything else is text-editable (if editable at all).
-  const columnModes: CellMode[] = columns.map((col, ci) => {
-    if (!editable) return 'readonly';
-    if (ci === recordIdColumn) return 'readonly';
-    if (enums[col.toLowerCase()]) return 'enum';
-    return 'text';
-  });
+  // Per-column mode. Memoized — passed to every Row, so a fresh array here
+  // would defeat Row's memo() and re-render the whole grid on every selection.
+  const columnModes: CellMode[] = useMemo(
+    () =>
+      columns.map((col, ci) => {
+        if (!editable) return 'readonly';
+        if (ci === recordIdColumn) return 'readonly';
+        if (enums[col.toLowerCase()]) return 'enum';
+        return 'text';
+      }),
+    [columns, enums, recordIdColumn, editable],
+  );
 
   // Formula bar content
   const selectedValue =
@@ -480,7 +478,6 @@ export default function SpreadsheetViewer({
                   columns={columns}
                   columnModes={columnModes}
                   enums={enums}
-                  colWidths={colWidths}
                   selectedCol={selected?.row === ri ? selected.col : null}
                   isMissing={missingRows?.has(ri) ?? false}
                   recordId={rid}

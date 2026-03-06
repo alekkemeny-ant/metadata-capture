@@ -127,3 +127,16 @@ try:
 
 except ImportError:
     pass
+
+
+def species_name_to_dict(name: str) -> dict[str, str]:
+    """Reconstruct the full species dict from a display name.
+
+    `species` is stored as {name, registry, registry_identifier}. When a user
+    picks a name from a dropdown (or the agent sends a name via capture_metadata),
+    this reconstructs the complete dict so shallow-merge doesn't lose registry
+    info. Falls back to {name} when the species isn't in SPECIES_REGISTRY.
+    """
+    if name in SPECIES_REGISTRY:
+        return dict(SPECIES_REGISTRY[name])
+    return {"name": name}

@@ -167,46 +167,49 @@ async def get_record_endpoint(record_id: str) -> dict[str, Any]:
     return record
 
 
+async def _apply_record_update(
+    record_id: str, record_type: str, data_patch: dict[str, Any]
+) -> dict[str, Any]:
+    """Shared tail for PUT and PATCH: merge → validate → refetch."""
+    from .tools.metadata_store import get_record, update_record, update_record_validation
+    from .validation import validate_record
+
+    result = await update_record(record_id, data=data_patch)
+    if result is None:
+        raise HTTPException(status_code=500, detail="Failed to update record")
+
+    validation = validate_record(record_type, result.get("data_json") or {})
+    await update_record_validation(record_id, validation.to_dict())
+
+    updated = await get_record(record_id)
+    if updated is None:
+        raise HTTPException(status_code=500, detail="Record not found after update")
+    return updated
+
+
 @app.put("/records/{record_id}")
 async def update_record_endpoint(record_id: str, req: UpdateRecordDataRequest) -> dict[str, Any]:
     """Update a record's data."""
-    from .tools.metadata_store import get_record, update_record
-    from .validation import validate_record
+    from .tools.metadata_store import get_record
 
     existing = await get_record(record_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Record not found")
 
-    result = await update_record(record_id, data=req.data)
-    if result is None:
-        raise HTTPException(status_code=500, detail="Failed to update record")
-
-    # Re-validate
-    from .tools.metadata_store import update_record_validation
-    validation = validate_record(existing["record_type"], result.get("data_json") or {})
-    await update_record_validation(record_id, validation.to_dict())
-
-    updated = await get_record(record_id)
-    if updated is None:
-        raise HTTPException(status_code=404, detail="Record not found after update")
-    return updated
+    return await _apply_record_update(record_id, existing["record_type"], req.data)
 
 
 def _build_field_patch(field: str, value: str) -> dict[str, Any]:
     """Map a flat (field, value) pair to the correct data_json shape.
 
-    Most fields are flat strings. `species` is stored as a nested dict
-    {name, registry, registry_identifier} — a naive flat write would clobber
-    the registry info (see metadata_store.update_record's shallow merge).
-    Instead, reconstruct the full dict from SPECIES_REGISTRY so the shallow
-    merge replaces old-complete-dict with new-complete-dict.
+    `species` is stored nested — a naive flat write would clobber registry
+    info via update_record's shallow merge. species_name_to_dict reconstructs
+    the complete dict so shallow merge replaces old-complete with new-complete.
     """
-    from .schema_info import SPECIES_REGISTRY
+    from .schema_info import species_name_to_dict
 
     if field == "species":
-        if value in SPECIES_REGISTRY:
-            return {"species": dict(SPECIES_REGISTRY[value])}
-        return {"species": {"name": value}}
+        return {"species": species_name_to_dict(value)}
     return {field: value}
 
 
@@ -220,8 +223,7 @@ async def patch_record_field(record_id: str, req: PatchFieldRequest) -> dict[str
     - Takes only {field, value} — server-side merge, no read-before-write race
     """
     from .schema_info import KNOWN_FIELDS
-    from .tools.metadata_store import get_record, update_record, update_record_validation
-    from .validation import validate_record
+    from .tools.metadata_store import get_record
 
     existing = await get_record(record_id)
     if existing is None:
@@ -235,19 +237,9 @@ async def patch_record_field(record_id: str, req: PatchFieldRequest) -> dict[str
             detail=f"Unknown field '{req.field}' for record type '{record_type}'",
         )
 
-    data_patch = _build_field_patch(req.field, req.value)
-
-    result = await update_record(record_id, data=data_patch)
-    if result is None:
-        raise HTTPException(status_code=500, detail="Update failed")
-
-    validation = validate_record(record_type, result.get("data_json") or {})
-    await update_record_validation(record_id, validation.to_dict())
-
-    updated = await get_record(record_id)
-    if updated is None:
-        raise HTTPException(status_code=500, detail="Record not found after update")
-    return updated
+    return await _apply_record_update(
+        record_id, record_type, _build_field_patch(req.field, req.value)
+    )
 
 
 @app.post("/records/{record_id}/confirm")

@@ -27,7 +27,6 @@ const baseProps = {
   isSelected: false,
   onSelect: () => {},
   onCommit: async () => {},
-  widthPx: 120,
 };
 
 describe('EditableCell — display mode', () => {
