@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { sendChatMessage, fetchMessages, fetchModels, uploadFile, getUploadUrl, MessageAttachment } from '../lib/api';
+import { sendChatMessage, fetchMessages, fetchModels, uploadFile, getUploadUrl, getUploadExtraction, MessageAttachment } from '../lib/api';
 import ArtifactModal, { ArtifactSource } from './ArtifactModal';
 
 // ---------------------------------------------------------------------------
@@ -24,6 +24,18 @@ const SPREADSHEET_TYPES = new Set([
 
 function isSpreadsheet(typeOrName: string): boolean {
   return SPREADSHEET_TYPES.has(typeOrName) || typeOrName.toLowerCase().endsWith('.csv') || typeOrName.toLowerCase().endsWith('.xlsx');
+}
+
+// Compact icon for non-image attachment chips (preview strip + sent messages)
+function fileTypeIcon(contentType: string, filename: string): string {
+  const ext = filename.toLowerCase().split('.').pop() || '';
+  if (contentType.startsWith('image/')) return '🖼️';
+  if (contentType === 'application/pdf') return '📕';
+  if (contentType.startsWith('audio/') || ['mp3', 'wav', 'm4a', 'ogg'].includes(ext)) return '🎵';
+  if (contentType.startsWith('video/') || ['mp4', 'mov', 'webm', 'mkv'].includes(ext)) return '🎬';
+  if (['csv', 'xlsx', 'xls'].includes(ext)) return '📊';
+  if (ext === 'docx') return '📄';
+  return '📝';
 }
 
 // SpeechRecognition type shim for browsers that support it
@@ -332,11 +344,20 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
   const [isDragging, setIsDragging] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [openArtifact, setOpenArtifact] = useState<ArtifactSource | null>(null);
+  // Background extraction status per uploaded file (non-image/pdf only)
+  const [extractionStatus, setExtractionStatus] = useState<Record<string, 'pending' | 'done' | 'error'>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+
+  // Track mount state so async polls don't update state after unmount
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -384,18 +405,34 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
   // File attachment helpers
   // ---------------------------------------------------------------------------
 
+  // Server validates MIME/extension; client only enforces the size cap.
   const addFiles = (files: FileList | File[]) => {
-    const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf'];
     const newAttachments: FileAttachment[] = [];
     for (const file of Array.from(files)) {
-      const ok = allowed.includes(file.type) || isSpreadsheet(file.type) || isSpreadsheet(file.name);
-      if (!ok) continue;
-      if (file.size > 20 * 1024 * 1024) continue;
+      if (file.size > 100 * 1024 * 1024) continue;  // 100 MB — matches server MAX_UPLOAD_SIZE
       const preview = file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined;
       newAttachments.push({ file, preview });
     }
     if (newAttachments.length) setPendingFiles((prev) => [...prev, ...newAttachments]);
   };
+
+  // Poll /uploads/{id}/extraction until done/error or max attempts.
+  // Recursive setTimeout — terminates naturally, no interval to leak.
+  const pollExtraction = useCallback((fileId: string, attempt = 0) => {
+    if (attempt >= 10 || !mountedRef.current) return;
+    getUploadExtraction(fileId)
+      .then((result) => {
+        if (!mountedRef.current) return;
+        setExtractionStatus((prev) => ({ ...prev, [fileId]: result.status }));
+        if (result.status === 'pending') {
+          setTimeout(() => pollExtraction(fileId, attempt + 1), 1000);
+        }
+      })
+      .catch(() => {
+        if (!mountedRef.current) return;
+        setExtractionStatus((prev) => ({ ...prev, [fileId]: 'error' }));
+      });
+  }, []);
 
   const removeFile = (index: number) => {
     setPendingFiles((prev) => {
@@ -522,6 +559,12 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
           filename: u.filename,
           content_type: u.content_type,
         }));
+        // Kick off extraction polling for non-image/pdf files — fire-and-forget, doesn't block SSE
+        uploaded.forEach((u) => {
+          if (u.content_type.startsWith('image/') || u.content_type === 'application/pdf') return;
+          setExtractionStatus((prev) => ({ ...prev, [u.id]: 'pending' }));
+          setTimeout(() => pollExtraction(u.id), 1000);
+        });
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Upload failed');
         return;
@@ -737,6 +780,10 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
                                 </a>
                               );
                             }
+                            const extStatus = extractionStatus[att.file_id];
+                            const processing = extStatus === 'pending' && (
+                              <span className="text-[10px] opacity-70 animate-pulse ml-0.5">processing&hellip;</span>
+                            );
                             if (isSpreadsheet(att.content_type) || isSpreadsheet(att.filename)) {
                               return (
                                 <button
@@ -745,19 +792,17 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
                                   className="flex items-center gap-1.5 bg-white/20 hover:bg-white/30 rounded-lg px-3 py-1.5 text-xs transition-colors"
                                   title="View spreadsheet"
                                 >
-                                  <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3.375 19.5h17.25m-17.25 0a1.125 1.125 0 01-1.125-1.125M3.375 19.5h7.5c.621 0 1.125-.504 1.125-1.125m-9.75 0V5.625m0 12.75v-1.5c0-.621.504-1.125 1.125-1.125m18.375 2.625V5.625m0 12.75c0 .621-.504 1.125-1.125 1.125m1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125m0 0h-7.5m-9 0h9m-9 0a1.125 1.125 0 00-1.125 1.125M12 18.375v-1.5m0 1.5c0 .621.504 1.125 1.125 1.125M12 18.375a1.125 1.125 0 01-1.125 1.125M3.375 5.625c0-.621.504-1.125 1.125-1.125h15c.621 0 1.125.504 1.125 1.125m-17.25 0V9.75c0 .621.504 1.125 1.125 1.125h15c.621 0 1.125-.504 1.125-1.125V5.625m-17.25 0h17.25" />
-                                  </svg>
+                                  <span className="text-sm leading-none">{fileTypeIcon(att.content_type, att.filename)}</span>
                                   {att.filename}
+                                  {processing}
                                 </button>
                               );
                             }
                             return (
                               <div key={ai} className="flex items-center gap-1.5 bg-white/20 rounded-lg px-3 py-1.5 text-xs">
-                                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-                                </svg>
+                                <span className="text-sm leading-none">{fileTypeIcon(att.content_type, att.filename)}</span>
                                 {att.filename}
+                                {processing}
                               </div>
                             );
                           })}
@@ -798,15 +843,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
                     <img src={att.preview} alt={att.file.name} className="w-16 h-16 rounded-lg object-cover border border-sand-200" />
                   ) : (
                     <div className="w-16 h-16 rounded-lg border border-sand-200 bg-sand-50 flex flex-col items-center justify-center">
-                      {isSpreadsheet(att.file.type) || isSpreadsheet(att.file.name) ? (
-                        <svg className="w-5 h-5 text-brand-aqua-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3.375 19.5h17.25m-17.25 0a1.125 1.125 0 01-1.125-1.125M3.375 19.5h7.5c.621 0 1.125-.504 1.125-1.125m-9.75 0V5.625m0 12.75v-1.5c0-.621.504-1.125 1.125-1.125m18.375 2.625V5.625m0 12.75c0 .621-.504 1.125-1.125 1.125m1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125m0 0h-7.5m-9 0h9m-9 0a1.125 1.125 0 00-1.125 1.125M12 18.375v-1.5m0 1.5c0 .621.504 1.125 1.125 1.125M12 18.375a1.125 1.125 0 01-1.125 1.125M3.375 5.625c0-.621.504-1.125 1.125-1.125h15c.621 0 1.125.504 1.125 1.125m-17.25 0V9.75c0 .621.504 1.125 1.125 1.125h15c.621 0 1.125-.504 1.125-1.125V5.625m-17.25 0h17.25" />
-                        </svg>
-                      ) : (
-                        <svg className="w-5 h-5 text-sand-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-                        </svg>
-                      )}
+                      <span className="text-xl leading-none">{fileTypeIcon(att.file.type, att.file.name)}</span>
                       <span className="text-[9px] text-sand-500 mt-0.5 truncate max-w-[56px] px-1">{att.file.name}</span>
                     </div>
                   )}
@@ -826,7 +863,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
             ref={fileInputRef}
             type="file"
             multiple
-            accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,.csv,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,audio/mpeg,audio/wav,audio/mp4,audio/ogg,video/mp4,video/quicktime,video/webm,.txt,.md,.json,.yaml,.yml,.csv,.xlsx,.xls,.docx,.mp3,.wav,.m4a,.ogg,.mp4,.mov,.webm"
             className="hidden"
             onChange={(e) => {
               if (e.target.files?.length) addFiles(e.target.files);
@@ -887,7 +924,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
                 className="w-9 h-9 rounded-xl border border-sand-200
                            flex items-center justify-center text-sand-400
                            hover:text-sand-600 hover:bg-sand-50 transition-colors"
-                title="Attach image, PDF, or spreadsheet"
+                title="Attach files (images, PDF, text, spreadsheets, audio, video)"
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13" />
