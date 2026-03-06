@@ -456,6 +456,7 @@ async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
         return None
 
     images: list[tuple[bytes, str]] = []
+    decode_error: str | None = None
     raw_images = row["extracted_images_json"]
     if raw_images:
         try:
@@ -463,8 +464,11 @@ async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
                 images.append(
                     (base64.b64decode(item["data"]), item["caption"])
                 )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             logger.warning("Malformed extracted_images_json for upload %s", upload_id)
+            # Surface corruption to caller — don't silently pretend no images existed.
+            decode_error = f"stored image data unreadable: {exc}"
+            images = []
 
     meta: dict = {}
     raw_meta = row["extracted_meta_json"]
@@ -473,12 +477,13 @@ async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
         if isinstance(parsed, dict):
             meta = parsed
 
+    stored_error = row["extraction_error"]
     return {
         "status": row["extraction_status"],
         "text": row["extracted_text"],
         "images": images,
         "meta": meta,
-        "error": row["extraction_error"],
+        "error": decode_error or stored_error,
     }
 
 

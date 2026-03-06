@@ -218,6 +218,10 @@ async def extract_keyframes(src: Path, count: int = 3) -> list[tuple[bytes, str]
                 continue
             if rc != 0 or not out_png.exists():
                 continue
+            # scale=1024:-1 should keep frames under ~500KB, but skip pathological
+            # outliers so a single frame can't balloon the extraction payload.
+            if out_png.stat().st_size > 5_000_000:
+                continue
             frames.append((out_png.read_bytes(), f"Frame at {ts:.1f}s"))
 
     return frames

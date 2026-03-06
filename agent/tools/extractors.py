@@ -219,7 +219,14 @@ async def extract_video(path: Path, content_type: str) -> ExtractedContent:
     images: list[tuple[bytes, str]] = []
     errors: list[str] = []
 
-    if isinstance(transcript_r, BaseException):
+    # gather(return_exceptions=True) surfaces BaseException subclasses as values.
+    # Re-raise BaseException-but-not-Exception (KeyboardInterrupt, SystemExit,
+    # GeneratorExit) — those must propagate, not be stringified into .error.
+    for r in (transcript_r, frames_r):
+        if isinstance(r, BaseException) and not isinstance(r, Exception):
+            raise r
+
+    if isinstance(transcript_r, Exception):
         if isinstance(transcript_r, asyncio.TimeoutError):
             errors.append(f"Transcription timed out after {T.TRANSCRIBE_TIMEOUT_SEC}s")
         else:
@@ -227,12 +234,12 @@ async def extract_video(path: Path, content_type: str) -> ExtractedContent:
     else:
         text = transcript_r
 
-    if isinstance(frames_r, BaseException):
+    if isinstance(frames_r, Exception):
         errors.append(f"Keyframe extraction failed: {frames_r}")
     else:
         images = frames_r
 
-    transcribed = not isinstance(transcript_r, BaseException)
+    transcribed = not isinstance(transcript_r, Exception)
     n_frames = len(images)
 
     # Both failed → error-only result.
