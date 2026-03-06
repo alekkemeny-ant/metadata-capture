@@ -332,6 +332,12 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
   const [isDragging, setIsDragging] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [openArtifact, setOpenArtifact] = useState<ArtifactSource | null>(null);
+  // Dev-only: expose modal opener for e2e tests (no URL route to the modal)
+  useEffect(() => {
+    if (process.env.NODE_ENV === 'development') {
+      (window as unknown as { __openArtifact?: typeof setOpenArtifact }).__openArtifact = setOpenArtifact;
+    }
+  }, []);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
