@@ -418,6 +418,39 @@ function saveMessagesToStorage(sessionId: string, messages: StructuredMessage[])
   } catch { /* quota exceeded — best-effort */ }
 }
 
+// ---------------------------------------------------------------------------
+// Module-level stream registry — claude.ai keyed-store pattern
+// ---------------------------------------------------------------------------
+//
+// Each in-flight stream gets an entry here, keyed by its session ID (once
+// known — new chats start with a temporary key then rebind). Switching
+// sessions does NOT abort the stream; it keeps writing to its registry
+// entry + localStorage. When the user switches back to that session, the
+// ChatPanel instance subscribes to the entry and live tokens resume.
+//
+// This lives at module scope so it survives ChatPanel re-renders and even
+// remounts (e.g. switching tabs). The only thing that kills a stream is
+// the explicit Stop button or component tree unmount (page nav).
+
+interface StreamEntry {
+  sid: string;                         // session_id once assigned (or temp key for brand-new chats)
+  messages: StructuredMessage[];       // accumulated stream output, canonical
+  done: boolean;
+  subscribers: Set<(msgs: StructuredMessage[], done: boolean) => void>;
+  abort: () => void;
+}
+
+const streamRegistry = new Map<string, StreamEntry>();
+
+/** Get the live stream entry for a session, if any. A brand-new chat's
+ * stream is registered under a temp key until the first SSE chunk
+ * delivers its real session_id — callers with sessionId=null can't
+ * find it, which is correct (the empty chat view is intentional). */
+function getStreamForSession(sessionId: string | null): StreamEntry | undefined {
+  if (!sessionId) return undefined;
+  return streamRegistry.get(sessionId);
+}
+
 /** Best-effort check for messages that were sent files-only. The backend
  * doesn't persist attachmentOnly, so when localStorage is absent we infer
  * it: user message with attachments whose content matches the derived label
@@ -492,12 +525,10 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  // Monotonic token identifying which stream "owns" the UI. Bumped when the
-  // user switches sessions or clicks New Chat, so any in-flight SSE callback
-  // can detect it's stale and stop scribbling tokens into the wrong
-  // conversation. This is the claude.ai pattern — session ID alone isn't
-  // enough since a new chat has no ID until the first chunk arrives.
-  const activeStreamIdRef = useRef(0);
+  // Subscription to the live stream (if any) for the current session.
+  // Set when we detect a registry entry on session switch, cleared on
+  // next switch or when the stream completes.
+  const streamSubRef = useRef<(() => void) | null>(null);
   const mountedRef = useRef(true);
   // Track whether the user has scrolled away from the bottom. While pinned,
   // every streaming token auto-scrolls; once the user scrolls up, we stop
@@ -548,18 +579,43 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
     });
   }, []);
 
-  // Load messages when sessionId changes, restoring blocks & partial messages.
-  // Bumps the stream owner token + aborts any in-flight SSE fetch first —
-  // without this, switching chats (or clicking New Chat) mid-stream leaves
-  // the old fetch running, and its callbacks overwrite the freshly-loaded
-  // conversation with stale tokens. The token bump is defence-in-depth so
-  // even a chunk that races the abort gets dropped.
+  // Load messages when sessionId changes. Does NOT abort in-flight
+  // streams — they keep running in the background, writing to the
+  // module-level registry + localStorage. If the session we're
+  // switching TO has an active stream, subscribe to it so live tokens
+  // resume in this view.
   useEffect(() => {
-    activeStreamIdRef.current += 1;
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = null;
-    setIsStreaming(false);
+    // Unsubscribe from the previous session's stream (if any). The
+    // stream itself keeps running — we just stop receiving its ticks.
+    streamSubRef.current?.();
+    streamSubRef.current = null;
 
+    // Check for a live stream already running for this session.
+    const live = getStreamForSession(sessionId);
+    if (live && !live.done) {
+      // Registry has the canonical in-progress messages — use them
+      // directly instead of the DB (which is behind by up to 250ms of
+      // persist throttle + hasn't got the assistant turn until done).
+      setMessages(live.messages);
+      setIsStreaming(true);
+      // Subscribe: the stream's callback pushes updates to every
+      // subscriber after each chunk. This is how we get live tokens
+      // after switching back mid-stream.
+      const sub = (msgs: StructuredMessage[], done: boolean) => {
+        if (!mountedRef.current) return;
+        setMessages(msgs);
+        if (done) {
+          setIsStreaming(false);
+          streamSubRef.current = null;
+        }
+      };
+      live.subscribers.add(sub);
+      streamSubRef.current = () => live.subscribers.delete(sub);
+      return;
+    }
+
+    // No live stream — load from DB + localStorage as usual.
+    setIsStreaming(false);
     if (sessionId) {
       fetchMessages(sessionId)
         .then((msgs) => setMessages(restoreMessages(sessionId, msgs)))
@@ -567,11 +623,16 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
     } else {
       setMessages([]);
     }
-    // newChatNonce forces a re-run when "New Chat" is clicked while already
-    // in an unsaved new chat (sessionId null→null) — otherwise React's
-    // bail-out on equal state skips the abort.
+    // newChatNonce forces a re-run when "New Chat" is clicked while
+    // already in an unsaved new chat (sessionId stays null).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, newChatNonce]);
+
+  // Unsubscribe on unmount — the stream keeps running, but this
+  // component instance is gone.
+  useEffect(() => {
+    return () => { streamSubRef.current?.(); };
+  }, []);
 
   // Reset textarea height when input is cleared
   useEffect(() => {
@@ -800,12 +861,13 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
     // the user had scrolled up earlier in the conversation.
     isPinnedToBottomRef.current = true;
 
-    // Seed both the ref and state with the user msg + empty assistant slot.
-    // From here on the stream callbacks update messagesRef directly, then
-    // sync state only if still mounted — so navigation mid-stream doesn't
-    // lose tokens.
-    messagesRef.current = [...messagesRef.current, userMsg, { role: 'assistant', content: '' }];
-    setMessages(messagesRef.current);
+    // Seed initial state. From here the stream writes to its registry
+    // entry (canonical) and notifies subscribers — this component is
+    // just the first subscriber. Switching sessions keeps the stream
+    // running; switching back re-subscribes.
+    const initialMsgs = [...messagesRef.current, userMsg, { role: 'assistant' as const, content: '' }];
+    messagesRef.current = initialMsgs;
+    setMessages(initialMsgs);
     setInput('');
     pendingFiles.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
     setPendingFiles([]);
@@ -814,37 +876,83 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    // Capture session_id now — sessionStorage is set by sendChatMessage on
-    // the first SSE chunk, so for a new session this starts null.
+    // New chats start with a null sessionId — we use a temp key until
+    // the first SSE chunk arrives with the real one, then rebind.
     let sid = sessionId;
+    // Temp registry key stays separate from the real session so a
+    // second brand-new chat doesn't collide with the first's stream.
+    let registryKey = sid ?? `__pending_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
-    // Claim UI ownership. Any session switch / New Chat bumps the ref;
-    // callbacks check they still match before touching state. messagesRef
-    // keeps accumulating regardless so the full response ends up in
-    // localStorage under its original session.
-    const streamId = ++activeStreamIdRef.current;
-    const isStaleStream = () => activeStreamIdRef.current !== streamId;
+    // Register this stream. Subscribers (initially just us) get notified
+    // on every chunk + on completion. Switching away unsubscribes but
+    // leaves the entry; switching back finds it via getStreamForSession.
+    const entry: StreamEntry = {
+      sid: registryKey,
+      messages: initialMsgs,
+      done: false,
+      subscribers: new Set(),
+      abort: () => controller.abort(),
+    };
+    streamRegistry.set(registryKey, entry);
 
-    // Persist at most once per 250ms so we don't thrash localStorage at
-    // SSE-token rate. Final save on done is unconditional.
+    // We ourselves subscribe — same callback the session-switch effect
+    // would install. This is how we get live tokens in the UI.
+    const selfSub = (msgs: StructuredMessage[], done: boolean) => {
+      if (!mountedRef.current) return;
+      messagesRef.current = msgs;
+      setMessages(msgs);
+      if (done) {
+        setIsStreaming(false);
+        streamSubRef.current = null;
+        // For a brand-new chat, this is where sessionId finally
+        // settles — tell the parent so the URL/sidebar update.
+        if (sid && sessionId !== sid) onSessionChange(sid);
+      }
+    };
+    entry.subscribers.add(selfSub);
+    // Hook up the sub ref so the session-switch effect can unsubscribe
+    // this handler when we leave this session.
+    streamSubRef.current?.();
+    streamSubRef.current = () => entry.subscribers.delete(selfSub);
+
+    // Persist throttle — final save on done is unconditional.
     let lastPersist = 0;
     const maybePersist = () => {
       const now = Date.now();
       if (sid && now - lastPersist > 250) {
-        saveMessagesToStorage(sid, messagesRef.current);
+        saveMessagesToStorage(sid, entry.messages);
         lastPersist = now;
       }
+    };
+
+    // Push updated messages to all subscribers. Usually just us, but
+    // if the user switched away and back, the re-subscribed handler
+    // is in here too (and we were removed). May be empty — nobody
+    // watching — in which case we just persist and keep going.
+    const notify = (done: boolean) => {
+      entry.messages = [...entry.messages];  // new ref for React ===
+      entry.done = done;
+      entry.subscribers.forEach(sub => sub(entry.messages, done));
     };
 
     await sendChatMessage(
       userText,
       sessionId,
       (event) => {
-        // Pick up session_id from sessionStorage once the first chunk sets it.
-        sid ||= sessionStorage.getItem('chat_session_id');
+        // First chunk carries session_id. Rebind the registry entry
+        // from temp key → real sid so getStreamForSession() finds it.
+        if (!sid) {
+          sid = sessionStorage.getItem('chat_session_id');
+          if (sid && registryKey !== sid) {
+            streamRegistry.delete(registryKey);
+            registryKey = sid;
+            entry.sid = sid;
+            streamRegistry.set(sid, entry);
+          }
+        }
 
-        // --- Apply event to the ref (survives unmount) --------------------
-        const msgs = messagesRef.current;
+        // Apply event to the entry's canonical message array.
+        const msgs = entry.messages;
         const last = msgs[msgs.length - 1];
         if (!last || last.role !== 'assistant') return;
 
@@ -877,9 +985,7 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
         } else if (event.tool_result) {
           const result = event.tool_result as { tool_use_id: string; validation: ToolValidation };
           const idx = blocks.findIndex(b => b.type === 'tool_use' && b.toolUseId === result.tool_use_id);
-          if (idx !== -1) {
-            blocks[idx] = { ...blocks[idx], validation: result.validation };
-          }
+          if (idx !== -1) blocks[idx] = { ...blocks[idx], validation: result.validation };
         } else if (event.artifact) {
           const art = event.artifact as { id: string; type: string; title: string; tool_use_id?: string | null };
           const ref: ArtifactRef = { id: art.id, type: art.type, title: art.title };
@@ -891,51 +997,37 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
               if (blocks[k].type === 'tool_use') { idx = k; break; }
             }
           }
-          if (idx !== -1) {
-            blocks[idx] = { ...blocks[idx], artifact: ref };
-          }
+          if (idx !== -1) blocks[idx] = { ...blocks[idx], artifact: ref };
         }
-        // block_stop: no state change needed — next delta auto-starts a new block
 
-        // Replace last message in the ref. Use a new array so React's ===
-        // check sees a change when we sync to state.
-        messagesRef.current = [...msgs.slice(0, -1), { ...last, content, blocks }];
-
-        // Sync to state only if still mounted *and* the stream still owns
-        // the UI. Persist regardless — the response is saved under its
-        // original session so the user can come back to it.
-        if (mountedRef.current && !isStaleStream()) setMessages(messagesRef.current);
+        entry.messages = [...msgs.slice(0, -1), { ...last, content, blocks }];
+        notify(false);
         maybePersist();
       },
       () => {
-        // Only clear the shared ref if this stream still owns it — otherwise
-        // we'd null out the controller for a *newer* stream the user started
-        // in another session.
         if (abortControllerRef.current === controller) abortControllerRef.current = null;
         sid ||= sessionStorage.getItem('chat_session_id');
-        if (sid) {
-          // Unconditional final persist — ref has the complete stream even if
-          // the user navigated away mid-response.
-          saveMessagesToStorage(sid, messagesRef.current);
-        }
-        if (mountedRef.current && !isStaleStream()) {
-          setIsStreaming(false);
-          if (sid) onSessionChange(sid);
-        }
+        if (sid) saveMessagesToStorage(sid, entry.messages);
+        notify(true);
+        // Registry cleanup — entry is no longer live, future session
+        // loads go via DB + localStorage.
+        streamRegistry.delete(registryKey);
       },
       (err) => {
         if (abortControllerRef.current === controller) abortControllerRef.current = null;
-        // Strip the empty assistant slot on error
-        const trimmed = messagesRef.current.at(-1)?.content === ''
-          ? messagesRef.current.slice(0, -1)
-          : messagesRef.current;
-        messagesRef.current = trimmed;
-        if (sid) saveMessagesToStorage(sid, trimmed);
-        if (mountedRef.current && !isStaleStream()) {
-          setIsStreaming(false);
-          setError(err.message);
-          setMessages(trimmed);
+        // Strip empty assistant slot on error
+        if (entry.messages.at(-1)?.content === '') {
+          entry.messages = entry.messages.slice(0, -1);
         }
+        if (sid) saveMessagesToStorage(sid, entry.messages);
+        // Report the error only if this session is still active — we
+        // don't want a background-stream error banner popping up while
+        // the user is in a different chat.
+        if (mountedRef.current && entry.subscribers.size > 0) {
+          setError(err.message);
+        }
+        notify(true);
+        streamRegistry.delete(registryKey);
       },
       controller.signal,
       selectedModel || undefined,
@@ -1229,7 +1321,18 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
             {/* Send / Stop */}
             {isStreaming ? (
               <button
-                onClick={() => abortControllerRef.current?.abort()}
+                onClick={() => {
+                  // Stop whatever is streaming in THIS view. With
+                  // background streams, abortControllerRef may point at
+                  // a stream we started in a different session; the
+                  // registry lookup guarantees we hit the right one.
+                  const live = getStreamForSession(sessionId) ??
+                    // Fallback: Stop right after sending in a new chat,
+                    // before sid is known — abortControllerRef is
+                    // still the stream we just started.
+                    (abortControllerRef.current ? { abort: () => abortControllerRef.current?.abort() } : undefined);
+                  live?.abort();
+                }}
                 className="w-9 h-9 rounded-xl border border-sand-300 bg-white
                            flex items-center justify-center text-sand-600
                            hover:bg-sand-50 transition-colors"
