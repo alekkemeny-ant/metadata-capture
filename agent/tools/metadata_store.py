@@ -415,6 +415,8 @@ async def set_upload_extraction(
     ])
     meta_json = json.dumps(meta)
     status = "error" if error else "done"
+    # Database.execute() auto-commits on the SQLite backend and asyncpg
+    # doesn't need explicit commit outside transactions — no .commit() here.
     await db.execute(
         """UPDATE uploads
            SET extracted_text = ?,
@@ -425,7 +427,6 @@ async def set_upload_extraction(
            WHERE id = ?""",
         (text, images_json, meta_json, status, error, upload_id),
     )
-    await db.commit()
 
 
 async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
@@ -436,13 +437,12 @@ async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
     doesn't exist.
     """
     db = await get_db()
-    cursor = await db.execute(
+    row = await db.fetchrow(
         """SELECT extraction_status, extracted_text, extracted_images_json,
                   extracted_meta_json, extraction_error
            FROM uploads WHERE id = ?""",
         (upload_id,),
     )
-    row = await cursor.fetchone()
     if row is None:
         return None
 
@@ -497,7 +497,6 @@ async def create_artifact(
            VALUES (?, ?, ?, ?, ?, ?)""",
         (artifact_id, session_id, artifact_type, title, _serialize(content), language),
     )
-    await db.commit()
     created = await get_artifact(artifact_id)
     assert created is not None
     return created
@@ -506,8 +505,7 @@ async def create_artifact(
 async def get_artifact(artifact_id: str) -> dict[str, Any] | None:
     """Fetch a single artifact by ID, with content parsed from JSON."""
     db = await get_db()
-    cursor = await db.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
-    row = await cursor.fetchone()
+    row = await db.fetchrow("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
     if row is None:
         return None
     d = dict(row)
@@ -518,11 +516,10 @@ async def get_artifact(artifact_id: str) -> dict[str, Any] | None:
 async def list_artifacts(session_id: str) -> list[dict[str, Any]]:
     """List all artifacts for a session, newest first."""
     db = await get_db()
-    cursor = await db.execute(
+    rows = await db.fetch(
         "SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at DESC",
         (session_id,),
     )
-    rows = await cursor.fetchall()
     result = []
     for row in rows:
         d = dict(row)

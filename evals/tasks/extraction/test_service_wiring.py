@@ -277,8 +277,11 @@ def test_history_no_attachments_no_markers():
 
 def test_extraction_db_round_trip(tmp_path, monkeypatch):
     """What set_upload_extraction writes, get_upload_extraction reads back."""
-    monkeypatch.setattr("agent.db.database.DB_PATH", str(tmp_path / "rt.db"))
-    monkeypatch.setattr("agent.db.database._db_connection", None)
+    # Point the SQLite backend at a temp dir and clear the singleton so
+    # get_db() re-creates it with the new path. DB_PATH/_db_connection were
+    # removed by the Database ABC refactor — METADATA_DB_DIR + _db now drive this.
+    monkeypatch.setenv("METADATA_DB_DIR", str(tmp_path))
+    monkeypatch.setattr("agent.db.database._db", None)
 
     from agent.db.database import init_db, close_db
     from agent.tools.metadata_store import (
@@ -311,8 +314,8 @@ def test_extraction_db_round_trip(tmp_path, monkeypatch):
 
 def test_extraction_db_round_trip_error_status(tmp_path, monkeypatch):
     """Writing with error → status becomes 'error'."""
-    monkeypatch.setattr("agent.db.database.DB_PATH", str(tmp_path / "rt_err.db"))
-    monkeypatch.setattr("agent.db.database._db_connection", None)
+    monkeypatch.setenv("METADATA_DB_DIR", str(tmp_path))
+    monkeypatch.setattr("agent.db.database._db", None)
 
     from agent.db.database import init_db, close_db
     from agent.tools.metadata_store import (
