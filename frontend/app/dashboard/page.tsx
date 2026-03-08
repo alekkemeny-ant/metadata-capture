@@ -3,7 +3,10 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from 'react';
 import Link from 'next/link';
 import { fetchRecords, confirmRecord, updateRecordData, MetadataRecord, fetchSessions, Session } from '../lib/api';
-import Header from '../components/Header';
+import AppSidebar from '../components/AppSidebar';
+import { useSidebar } from '../components/SidebarContext';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -288,7 +291,7 @@ function RecordEditor({
               key={field.key}
               className="flex text-xs gap-2 items-center rounded px-1 -mx-1 py-0.5 group hover:bg-sand-50"
             >
-              <span className="text-sand-400 shrink-0 w-36 truncate capitalize">{field.label}:</span>
+              <span className="text-sand-400 shrink-0 w-24 sm:w-36 truncate capitalize">{field.label}:</span>
               {editingKey === field.key ? (
                 <input
                   autoFocus
@@ -312,7 +315,8 @@ function RecordEditor({
                   </span>
                   <button
                     onClick={() => deleteField(field.key)}
-                    className="opacity-0 group-hover:opacity-100 transition-opacity text-sand-300 hover:text-brand-orange-600 shrink-0"
+                    className="transition-opacity text-sand-300 hover:text-brand-orange-600 shrink-0
+                               opacity-100 md:opacity-0 md:group-hover:opacity-100"
                   >
                     <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
                       <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6" />
@@ -341,7 +345,7 @@ function RecordEditor({
               onKeyDown={(e) => {
                 if (e.key === 'Escape') { setAddingField(false); setNewKey(''); setNewValue(''); }
               }}
-              className="w-36 shrink-0 border-b border-sand-300 bg-transparent py-0.5 focus:outline-none focus:border-brand-fig placeholder:text-sand-300"
+              className="w-24 sm:w-36 shrink-0 border-b border-sand-300 bg-transparent py-0.5 focus:outline-none focus:border-brand-fig placeholder:text-sand-300"
             />
             <span className="text-sand-400">:</span>
             <input
@@ -410,24 +414,118 @@ function SessionView({
     );
   }
 
+  // Shared expanded-content renderer — used by both the desktop table row and
+  // the mobile card stack so behavior stays identical across layouts.
+  // items-start overrides grid's default align-items:stretch so short cards
+  // don't get stretched to the row's tallest sibling. Tall cards are capped
+  // by RecordEditor's internal max-height+scroll so the grid doesn't stretch
+  // to fit a 40-field procedures dump.
+  const renderExpandedContent = (sessionRecords: MetadataRecord[]) => (
+    <>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
+        {sessionRecords.map((r) => (
+          <div key={r.id} id={`record-${r.id}`} className="min-w-0">
+            <RecordEditor record={r} onSaved={onFieldSaved} />
+          </div>
+        ))}
+      </div>
+      {sessionRecords.some((r) => r.status === 'draft') && (
+        <div className="flex flex-wrap gap-2 pt-3 mt-3 border-t border-sand-200">
+          {sessionRecords.filter((r) => r.status === 'draft').map((r) => (
+            <button
+              key={r.id}
+              onClick={() => onConfirm(r.id)}
+              className="px-3 py-1.5 bg-brand-aqua-500 text-white text-xs font-medium rounded-lg hover:bg-brand-aqua-700 transition-colors"
+            >
+              Confirm {RECORD_TYPE_LABELS[r.record_type]}
+            </button>
+          ))}
+          <Link
+            href="/"
+            className="px-3 py-1.5 bg-sand-100 text-sand-600 text-xs font-medium rounded-lg hover:bg-sand-200 transition-colors border border-sand-200"
+          >
+            Continue Capture
+          </Link>
+        </div>
+      )}
+    </>
+  );
+
   return (
-    <table className="w-full table-fixed bg-white rounded-xl border border-sand-200 overflow-hidden">
-      {/* table-fixed + colgroup locks column widths so the expanded colSpan row
-          can't reflow sibling rows. Without this, table-layout:auto recomputes
-          every column width whenever an expanded row renders its inner grid.
-          Records gets the flex column since chips need room to wrap; Session
-          title is already truncate max-w-xs so it doesn't need extra space. */}
-      {/* Session (title truncates at max-w-xs) / Records chips (flex) / Created / Actions */}
-      <colgroup><col className="w-80" /><col /><col className="w-44" /><col className="w-24" /></colgroup>
-      <thead>
-        <tr className="bg-sand-50 border-b border-sand-200">
-          <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Session</th>
-          <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Records</th>
-          <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Created</th>
-          <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Actions</th>
-        </tr>
-      </thead>
-      <tbody>
+    <>
+      {/* ─────────────────── Desktop: 4-column table ───────────────────
+          table-fixed + colgroup locks column widths so the expanded colSpan
+          row can't reflow sibling rows. Without this, table-layout:auto
+          recomputes every column width whenever an expanded row renders its
+          inner grid. Records gets the flex column since chips need room to
+          wrap; Session title is already truncate max-w-xs so it doesn't need
+          extra space. */}
+      <table className="hidden md:table w-full table-fixed bg-white rounded-xl border border-sand-200 overflow-hidden">
+        {/* Session / Records chips (flex) / Created / Actions */}
+        <colgroup><col className="w-80" /><col /><col className="w-44" /><col className="w-24" /></colgroup>
+        <thead>
+          <tr className="bg-sand-50 border-b border-sand-200">
+            <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Session</th>
+            <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Records</th>
+            <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Created</th>
+            <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {allSessionIds.map((sid) => {
+            const sessionRecords = bySession[sid] || [];
+            const session = sessions.find((s) => s.session_id === sid);
+            const title = session?.first_message?.slice(0, 60) || sid.slice(0, 12);
+            const isExpanded = expandedId === sid;
+
+            return (
+              <Fragment key={sid}>
+                <tr
+                  id={`row-${sid}`}
+                  onClick={() => onToggle(sid)}
+                  className="border-b border-sand-100 hover:bg-sand-50 cursor-pointer transition-colors"
+                >
+                  <td className="px-6 py-4">
+                    <div className="text-sm font-medium text-sand-800 truncate max-w-xs">{title}</div>
+                    <div className="text-xs text-sand-400">{sid.slice(0, 8)}</div>
+                  </td>
+                  <td className="px-6 py-4">
+                    <div className="flex flex-wrap gap-1">
+                      {sessionRecords.length > 0 ? sessionRecords.map((r) => (
+                        <span key={r.id} className="inline-flex items-center px-2 py-0.5 rounded bg-brand-coral/30 text-brand-fig text-xs">
+                          {r.record_type.replace(/_/g, ' ')}
+                        </span>
+                      )) : (
+                        <span className="text-xs text-sand-400 italic">No records</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-6 py-4 text-sm text-sand-500">
+                    {session ? new Date(session.created_at).toLocaleString() : '—'}
+                  </td>
+                  <td className="px-6 py-4">
+                    <button className="text-xs text-brand-fig hover:text-brand-magenta-800 font-medium">
+                      {isExpanded ? 'Collapse' : 'Expand'}
+                    </button>
+                  </td>
+                </tr>
+                {isExpanded && (
+                  <tr key={`${sid}-expanded`}>
+                    <td colSpan={4} className="px-6 py-4 bg-sand-50 border-b border-sand-200">
+                      {renderExpandedContent(sessionRecords)}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+
+      {/* ─────────────────── Mobile: card stack ───────────────────
+          Each session is a tappable card; tapping reveals the same
+          RecordEditor grid used by the desktop expanded row. */}
+      <div className="md:hidden space-y-3">
         {allSessionIds.map((sid) => {
           const sessionRecords = bySession[sid] || [];
           const session = sessions.find((s) => s.session_id === sid);
@@ -435,78 +533,47 @@ function SessionView({
           const isExpanded = expandedId === sid;
 
           return (
-            <Fragment key={sid}>
-              <tr
-                id={`row-${sid}`}
+            <div
+              key={sid}
+              id={`row-${sid}-m`}
+              className="bg-white rounded-xl border border-sand-200 overflow-hidden"
+            >
+              <div
                 onClick={() => onToggle(sid)}
-                className="border-b border-sand-100 hover:bg-sand-50 cursor-pointer transition-colors"
+                className="p-4 cursor-pointer active:bg-sand-50 transition-colors"
               >
-                <td className="px-6 py-4">
-                  <div className="text-sm font-medium text-sand-800 truncate max-w-xs">{title}</div>
-                  <div className="text-xs text-sand-400">{sid.slice(0, 8)}</div>
-                </td>
-                <td className="px-6 py-4">
-                  <div className="flex flex-wrap gap-1">
-                    {sessionRecords.length > 0 ? sessionRecords.map((r) => (
-                      <span key={r.id} className="inline-flex items-center px-2 py-0.5 rounded bg-brand-coral/30 text-brand-fig text-xs">
-                        {r.record_type.replace(/_/g, ' ')}
-                      </span>
-                    )) : (
-                      <span className="text-xs text-sand-400 italic">No records</span>
-                    )}
-                  </div>
-                </td>
-                <td className="px-6 py-4 text-sm text-sand-500">
-                  {session ? new Date(session.created_at).toLocaleString() : '—'}
-                </td>
-                <td className="px-6 py-4">
-                  <button className="text-xs text-brand-fig hover:text-brand-magenta-800 font-medium">
-                    {isExpanded ? 'Collapse' : 'Expand'}
-                  </button>
-                </td>
-              </tr>
-              {isExpanded && (
-                <tr key={`${sid}-expanded`}>
-                  <td colSpan={4} className="px-6 py-4 bg-sand-50 border-b border-sand-200">
-                    {/* items-start overrides grid's default align-items:stretch
-                        so short cards don't get stretched to the row's tallest
-                        sibling. Tall cards are capped by RecordEditor's
-                        internal max-height+scroll so the grid doesn't stretch
-                        to fit a 40-field procedures dump. */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
-                      {sessionRecords.map((r) => (
-                        <div key={r.id} id={`record-${r.id}`} className="min-w-0">
-                          <RecordEditor record={r} onSaved={onFieldSaved} />
-                        </div>
-                      ))}
+                <div className="flex items-start justify-between gap-2 mb-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-sand-800 truncate">{title}</div>
+                    <div className="text-xs text-sand-400">
+                      {session ? new Date(session.created_at).toLocaleDateString() : sid.slice(0, 8)}
                     </div>
-                    {sessionRecords.some((r) => r.status === 'draft') && (
-                      <div className="flex gap-2 pt-3 mt-3 border-t border-sand-200">
-                        {sessionRecords.filter((r) => r.status === 'draft').map((r) => (
-                          <button
-                            key={r.id}
-                            onClick={() => onConfirm(r.id)}
-                            className="px-3 py-1.5 bg-brand-aqua-500 text-white text-xs font-medium rounded-lg hover:bg-brand-aqua-700 transition-colors"
-                          >
-                            Confirm {RECORD_TYPE_LABELS[r.record_type]}
-                          </button>
-                        ))}
-                        <Link
-                          href="/"
-                          className="px-3 py-1.5 bg-sand-100 text-sand-600 text-xs font-medium rounded-lg hover:bg-sand-200 transition-colors border border-sand-200"
-                        >
-                          Continue Capture
-                        </Link>
-                      </div>
-                    )}
-                  </td>
-                </tr>
+                  </div>
+                  <svg className={`w-4 h-4 text-sand-400 transition-transform shrink-0 ${isExpanded ? 'rotate-180' : ''}`}
+                       fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                  </svg>
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {sessionRecords.length > 0 ? sessionRecords.map((r) => (
+                    <span key={r.id} className="inline-flex items-center px-2 py-0.5 rounded bg-brand-coral/30 text-brand-fig text-xs">
+                      {r.record_type.replace(/_/g, ' ')}
+                    </span>
+                  )) : (
+                    <span className="text-xs text-sand-400 italic">No records</span>
+                  )}
+                </div>
+              </div>
+              {isExpanded && (
+                <div className="px-4 pb-4 border-t border-sand-100 pt-3 bg-sand-50">
+                  {renderExpandedContent(sessionRecords)}
+                </div>
               )}
-            </Fragment>
+            </div>
           );
         })}
-      </tbody>
-    </table>
+      </div>
+    </>
   );
 }
 
@@ -613,6 +680,7 @@ function LibraryView({
 // ---------------------------------------------------------------------------
 
 export default function DashboardPage() {
+  const { setIsExpanded } = useSidebar();
   const [records, setRecords] = useState<MetadataRecord[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
@@ -620,6 +688,20 @@ export default function DashboardPage() {
   const [view, setView] = useState<'session' | 'library'>('session');
   const [filter, setFilter] = useState<string>('all');
   const [search, setSearch] = useState('');
+  const [agentOnline, setAgentOnline] = useState(false);
+
+  // Health poll — the sidebar shows the agent status indicator
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(3000) });
+        setAgentOnline(res.ok);
+      } catch { setAgentOnline(false); }
+    };
+    check();
+    const interval = setInterval(check, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -720,83 +802,101 @@ export default function DashboardPage() {
       : sessions.filter((s) => filteredSessionIds.has(s.session_id));
 
   return (
-    <div className="h-screen flex flex-col bg-white">
-      <Header />
+    <div className="h-screen flex bg-white overflow-hidden">
+      {/* Left rail — brand + nav + agent status. Sessions list suppressed here
+          since the dashboard already groups by session in its main content. */}
+      <AppSidebar agentOnline={agentOnline} showSessions={false} />
 
-      {/* Toolbar */}
-      <div className="bg-white border-b border-sand-200 px-6 py-3">
-        <div className="flex items-center gap-4">
-          {/* View toggle */}
-          <div className="flex gap-0.5 bg-sand-100 rounded-lg p-0.5">
+      {/* Main content */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Toolbar — wraps on mobile so the search input drops to a second row
+            instead of forcing horizontal overflow. */}
+        <div className="bg-white border-b border-sand-200 px-3 sm:px-6 py-2.5 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+            {/* Hamburger — mobile only, opens the app sidebar drawer */}
             <button
-              onClick={() => setView('session')}
-              className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                view === 'session' ? 'bg-white text-sand-800 shadow-sm' : 'text-sand-500 hover:text-sand-700'
-              }`}
+              onClick={() => setIsExpanded(true)}
+              className="md:hidden w-8 h-8 flex items-center justify-center rounded-lg
+                         text-sand-500 hover:text-sand-700 hover:bg-sand-100 transition-colors shrink-0"
+              title="Open menu"
             >
-              Sessions
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" viewBox="0 0 24 24">
+                <path d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
             </button>
-            <button
-              onClick={() => setView('library')}
-              className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                view === 'library' ? 'bg-white text-sand-800 shadow-sm' : 'text-sand-500 hover:text-sand-700'
-              }`}
-            >
-              Library
-            </button>
-          </div>
 
-          {/* Status filters */}
-          <div className="flex gap-1">
-            {(['all', 'draft', 'confirmed'] as const).map((f) => (
+            {/* View toggle */}
+            <div className="flex gap-0.5 bg-sand-100 rounded-lg p-0.5 shrink-0">
               <button
-                key={f}
-                onClick={() => setFilter(f)}
-                className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-                  filter === f
-                    ? 'bg-sand-800 text-white'
-                    : 'bg-sand-100 text-sand-500 hover:bg-sand-200'
+                onClick={() => setView('session')}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  view === 'session' ? 'bg-white text-sand-800 shadow-sm' : 'text-sand-500 hover:text-sand-700'
                 }`}
               >
-                {f.charAt(0).toUpperCase() + f.slice(1)} ({counts[f]})
+                Sessions
               </button>
-            ))}
+              <button
+                onClick={() => setView('library')}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  view === 'library' ? 'bg-white text-sand-800 shadow-sm' : 'text-sand-500 hover:text-sand-700'
+                }`}
+              >
+                Library
+              </button>
+            </div>
+
+            {/* Status filters */}
+            <div className="flex gap-1 shrink-0">
+              {(['all', 'draft', 'confirmed'] as const).map((f) => (
+                <button
+                  key={f}
+                  onClick={() => setFilter(f)}
+                  className={`px-2.5 sm:px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
+                    filter === f
+                      ? 'bg-sand-800 text-white'
+                      : 'bg-sand-100 text-sand-500 hover:bg-sand-200'
+                  }`}
+                >
+                  {f.charAt(0).toUpperCase() + f.slice(1)} ({counts[f]})
+                </button>
+              ))}
+            </div>
+
+            {/* Search — full width on its own row on mobile, fixed width inline on desktop */}
+            <input
+              type="text"
+              placeholder="Search records..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-full sm:w-64 sm:ml-auto px-3 py-1.5 text-sm border border-sand-300 rounded-lg
+                         focus:outline-none focus:ring-2 focus:ring-brand-fig/30 focus:border-brand-fig/50"
+            />
           </div>
-
-          <div className="flex-1" />
-
-          <input
-            type="text"
-            placeholder="Search records..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="w-64 px-3 py-1.5 text-sm border border-sand-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-fig/30 focus:border-brand-fig/50"
-          />
         </div>
-      </div>
 
-      {/* Content */}
-      <div className="flex-1 overflow-auto px-6 py-4">
-        {loading ? (
-          <div className="flex items-center justify-center h-64 text-sand-400">Loading...</div>
-        ) : view === 'session' ? (
-          <SessionView
-            records={filtered}
-            sessions={visibleSessions}
-            expandedId={expandedId}
-            onToggle={(id) => setExpandedId(expandedId === id ? null : id)}
-            onConfirm={handleConfirm}
-            onFieldSaved={load}
-          />
-        ) : (
-          <LibraryView
-            records={filtered}
-            expandedId={expandedId}
-            onToggle={(id) => setExpandedId(expandedId === id ? null : id)}
-            onConfirm={handleConfirm}
-            onFieldSaved={load}
-          />
-        )}
+        {/* Content */}
+        <div className="flex-1 overflow-auto px-3 sm:px-6 py-3 sm:py-4">
+          {loading ? (
+            <div className="flex items-center justify-center h-64 text-sand-400">Loading...</div>
+          ) : view === 'session' ? (
+            <SessionView
+              records={filtered}
+              sessions={visibleSessions}
+              expandedId={expandedId}
+              onToggle={(id) => setExpandedId(expandedId === id ? null : id)}
+              onConfirm={handleConfirm}
+              onFieldSaved={load}
+            />
+          ) : (
+            <LibraryView
+              records={filtered}
+              expandedId={expandedId}
+              onToggle={(id) => setExpandedId(expandedId === id ? null : id)}
+              onConfirm={handleConfirm}
+              onFieldSaved={load}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
