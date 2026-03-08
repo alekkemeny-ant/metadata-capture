@@ -93,14 +93,18 @@ metadata-capture/
 │
 ├── frontend/                       # Next.js 14 + TypeScript + Tailwind CSS
 │   ├── app/
-│   │   ├── page.tsx                # Three-pane layout: sessions sidebar | chat | metadata sidebar
-│   │   ├── dashboard/page.tsx      # Dashboard with session view + library view toggle
+│   │   ├── page.tsx                # Layout: AppSidebar | (top-bar + chat) | MetadataSidebar (desktop)
+│   │   ├── dashboard/page.tsx      # AppSidebar | session/library toggle (table on desktop, card stack on mobile)
 │   │   ├── components/
-│   │   │   ├── Header.tsx          # Shared nav bar + live Agent Online/Offline health indicator
-│   │   │   ├── ChatPanel.tsx       # Token-streaming chat, model selector, tool progress indicators
-│   │   │   ├── SessionsSidebar.tsx # Chat history list with first-message titles
-│   │   │   └── MetadataSidebar.tsx # Records grouped by type (shared/asset) with status badges
-│   │   └── lib/api.ts              # API client: chat (SSE + AbortSignal), metadata CRUD, sessions
+│   │   │   ├── AppSidebar.tsx      # Unified left rail: brand + nav + sessions + agent status
+│   │   │   │                       #   Desktop: slim 52px ↔ 256px expanded. Mobile: overlay drawer.
+│   │   │   ├── SidebarContext.tsx  # isExpanded / isMobile via matchMedia, localStorage persistence
+│   │   │   ├── ModelPicker.tsx     # Model selector — rendered in top bar (state owned by page.tsx)
+│   │   │   ├── ChatPanel.tsx       # Token-streaming chat, background-stream registry, tool indicators
+│   │   │   ├── MetadataSidebar.tsx # Records grouped by type (shared/asset) with status badges
+│   │   │   ├── ArtifactModal.tsx   # Full-screen viewer for agent-generated artifacts
+│   │   │   └── SpreadsheetViewer.tsx # Interactive grid for CSV/XLSX uploads + artifact tables
+│   │   └── lib/api.ts              # API client: chat (SSE + AbortSignal), records CRUD, uploads, sessions
 │   └── package.json
 │
 ├── evals/                          # Eval suite: 64 deterministic + 11 LLM-graded + 10 agent e2e
@@ -163,24 +167,25 @@ Three MCP tools for metadata capture:
 - Token-by-token SSE streaming via SDK `include_partial_messages` + `StreamEvent` deltas
 - Stop button aborts the stream mid-response via `AbortController`
 - Auto-expanding textarea (no height cap); send button is an up-arrow icon inside the input
-- Sessions sidebar lists all chats by first-message preview; click to switch, "New Chat" to start fresh
+- Sessions list in the unified `AppSidebar`; click to switch, "New Chat" to start fresh
 - Conversation history persists across page reloads (loaded from `GET /sessions/{id}/messages`)
 - Side panel with extracted metadata fields, expandable JSON sections
 - Metadata cards in the sidebar are clickable — navigate to the dashboard entry
-- Auto-refresh, status badges, mobile-responsive
+- **Background streams**: switching chats mid-response doesn't abort. Module-level stream registry keeps writing to its canonical messages array + localStorage; switching back re-subscribes and live tokens resume.
+- Auto-refresh, status badges
 
 ### Phase 5: Frontend — Dashboard ✅
 **Files:** `frontend/app/dashboard/page.tsx`
 
-- **Session view**: table grouped by chat session, expandable rows showing per-session records
+- **Session view**: `table-fixed` table with locked column widths on desktop; tappable card stack on mobile. Expandable rows show per-session records.
 - **Library view**: records grouped by type (Shared: subjects, procedures, instruments, rigs; Asset: sessions, etc.)
 - Toggle between views with a segmented control
 - **Inline editing**: click any value to edit; saves on Enter or blur
-- **Delete fields**: trash icon on hover
+- **Delete fields**: trash icon on hover (always visible on touch devices)
 - **Add fields**: `+ Add field` row at the bottom of every record
 - **Schema placeholders**: known fields shown as "click to add" rows
-- Confirm individual records, filter by status, search
-- Shared `Header` with live Agent Online / Offline indicator (polls `/health` every 5 s)
+- Confirm individual records, filter by status, search (`visibleSessions` filter hides sessions whose records were all filtered out)
+- Agent Online / Offline indicator lives in `AppSidebar` (polls `/health` every 5 s)
 
 ### Phase 6: Streaming & UX Polish ✅
 **Files:** `agent/service.py`, `frontend/app/components/ChatPanel.tsx`, `frontend/tailwind.config.ts`
@@ -192,7 +197,18 @@ Three MCP tools for metadata capture:
 - `capture_metadata` tool results auto-expand when validation issues are found
 - Validation streamed to frontend via `tool_result` SSE events (async queue piped from MCP tool handler)
 
-### Phase 7: Multimodal Upload + Extraction Pipeline ✅
+### Phase 7: Mobile + Unified Sidebar Refactor ✅
+**Files:** `frontend/app/components/AppSidebar.tsx`, `SidebarContext.tsx`, `ModelPicker.tsx`, `page.tsx`, `dashboard/page.tsx`, `layout.tsx`
+
+- **AppSidebar** replaces `Header.tsx` + `SessionsSidebar.tsx`. Brand + nav + sessions + agent status in one left rail. Desktop: slim 52px icon-only ↔ 256px expanded (persisted to localStorage). Mobile: hidden by default, opens as `fixed` overlay drawer with backdrop.
+- **SidebarContext**: `isMobile` via `matchMedia('(max-width: 767px)')` (matches Tailwind's `md:` breakpoint). `closeSidebarOnMobile()` called by nav link clicks. Escape key closes the mobile drawer.
+- **ModelPicker**: lifted out of ChatPanel's bottom-left corner into the top bar. State owned by `page.tsx` so both the picker UI and `sendChatMessage()` see the same value.
+- **Mobile metadata view**: full-screen overlay below the top bar (not a partial-width drawer). Document icon in top bar is the sole toggle — stays visible when open.
+- **Dashboard mobile**: toolbar wraps (hamburger + view toggle → status filters → search on its own row). Session table is `hidden md:table`; a `md:hidden` sibling renders tappable cards with the same expand logic.
+- **Touch targets**: hover-only delete buttons now `opacity-100 md:opacity-0 md:group-hover:opacity-100` — always visible on touch, hover-revealed on desktop.
+- **`viewport` export** added to `layout.tsx` — without it mobile browsers render at ~980px desktop width.
+
+### Phase 8: Multimodal Upload + Extraction Pipeline ✅
 **Files:** `agent/tools/extractors.py`, `agent/tools/transcribe.py`, `agent/server.py`, `agent/service.py`, `frontend/app/components/ChatPanel.tsx`
 
 - **Upload-time extraction**: `POST /upload` accepts 22 MIME types + 19 extensions (100 MB cap). Non-native types schedule `asyncio.create_task(_extract_and_store(...))` after the 200 response — single-worker uvicorn never blocks on transcription.
@@ -220,6 +236,9 @@ Three MCP tools for metadata capture:
 | Record linking | Explicit `record_links` table | Cross-session reuse of subjects, instruments, rigs |
 | Inline editing | Per-record PUT endpoint | Auto-saves on blur, no full-page reload |
 | Session titles | First user message from DB | Matches Claude desktop UX; no extra LLM call needed |
+| Sidebar pattern | Slim rail ↔ expanded, mobile overlay drawer | Patterned after claude.ai's SidebarNav — icons-only collapsed rail, backdrop drawer on mobile, CSS transitions (no framer-motion) |
+| Mobile breakpoint | `md` (768px) for both CSS and JS | `matchMedia` uses the same 767px threshold as Tailwind's `md:` so responsive classes and JS behavior never disagree |
+| Background streams | Module-level registry (keyed Map + subscriber Set) | Claude.ai keyed-store pattern. Stream owns its canonical messages array; switching sessions unsubscribes but leaves the stream running; switching back finds the entry and re-subscribes |
 | Schema validation | `aind-data-schema` Pydantic introspection | Canonical enums + unknown-field checks, no hardcoded drift |
 | Validation display | `tool_result` SSE + `contextvars` queue | Tool handler pushes results; stream drains them inline |
 | Upload extraction timing | Upload-time background task (not chat-time) | Single-worker uvicorn would stall all users for 120s during transcription |
