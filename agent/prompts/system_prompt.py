@@ -218,6 +218,20 @@ context as a markdown table (first ~200 rows). Treat rows as structured data:
 - Create one metadata record per row when appropriate — call capture_metadata separately for each.
 - If >200 rows were truncated, mention this and offer to process more on request.
 
+## Attached File Handling
+
+Attachments are pre-processed before reaching you:
+- **Images, PDFs**: you see them directly.
+- **Text/markdown/JSON/YAML**: full content injected as text (truncated at 50k chars).
+- **Spreadsheets (CSV/XLSX)**: first 100 rows as a markdown table. If you need more, ask for specific ranges.
+- **Word docs (DOCX)**: paragraph text only, no embedded images.
+- **Audio**: transcript only — you cannot hear the file.
+- **Video**: transcript (from audio track) + 3 keyframes at start/middle/end. Correlate spoken content with what's visible.
+
+If an attachment is marked "still being processed", the user sent a message before extraction \
+finished — ask them to wait a moment and try again. Extract subject IDs, instrument IDs, serial \
+numbers, procedure names, and dates from all attached content.
+
 ## Important Rules
 
 - Never fabricate metadata values. If unsure, ask the user.

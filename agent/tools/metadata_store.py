@@ -1,5 +1,6 @@
-"""Tools for persisting and retrieving metadata records in SQLite."""
+"""Tools for persisting and retrieving metadata records."""
 
+import base64
 import json
 import logging
 import uuid
@@ -26,8 +27,8 @@ def _parse_json(value: str | None) -> Any:
         return value
 
 
-def _row_to_dict(row) -> dict[str, Any]:
-    """Convert an aiosqlite Row to a plain dict, parsing JSON columns."""
+def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+    """Parse JSON columns in a row dict."""
     d = dict(row)
     if d.get("data_json"):
         d["data_json"] = _parse_json(d["data_json"])
@@ -100,7 +101,6 @@ async def create_record(
            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
         (record_id, session_id, record_type, category, display_name, _serialize(data), now, now),
     )
-    await db.commit()
     record = await get_record(record_id)
     assert record is not None, f"Record {record_id} not found after insert"
     return record
@@ -109,8 +109,7 @@ async def create_record(
 async def get_record(record_id: str) -> dict[str, Any] | None:
     """Get a single record by ID."""
     db = await get_db()
-    cursor = await db.execute("SELECT * FROM metadata_records WHERE id = ?", (record_id,))
-    row = await cursor.fetchone()
+    row = await db.fetchrow("SELECT * FROM metadata_records WHERE id = ?", (record_id,))
     return _row_to_dict(row) if row else None
 
 
@@ -145,7 +144,6 @@ async def update_record(
             (name, now, record_id),
         )
     elif data is not None:
-        # Auto-update name from merged data
         auto = _auto_name(existing["record_type"], merged_data)
         if auto:
             await db.execute(
@@ -153,7 +151,6 @@ async def update_record(
                 (auto, now, record_id),
             )
 
-    await db.commit()
     return await get_record(record_id)
 
 
@@ -177,30 +174,28 @@ async def update_record_validation(record_id: str, validation: dict[str, Any]) -
         "UPDATE metadata_records SET validation_json = ?, updated_at = ? WHERE id = ?",
         (_serialize(validation), now, record_id),
     )
-    await db.commit()
 
 
 async def confirm_record(record_id: str) -> dict[str, Any] | None:
     """Mark a record as confirmed."""
     db = await get_db()
     now = datetime.now(timezone.utc).isoformat()
-    cursor = await db.execute("SELECT id FROM metadata_records WHERE id = ?", (record_id,))
-    if await cursor.fetchone() is None:
+    row = await db.fetchrow("SELECT id FROM metadata_records WHERE id = ?", (record_id,))
+    if row is None:
         return None
     await db.execute(
         "UPDATE metadata_records SET status = 'confirmed', updated_at = ? WHERE id = ?",
         (now, record_id),
     )
-    await db.commit()
     return await get_record(record_id)
 
 
 async def delete_record(record_id: str) -> bool:
     """Delete a record and its links."""
     db = await get_db()
-    cursor = await db.execute("DELETE FROM metadata_records WHERE id = ?", (record_id,))
-    await db.commit()
-    return (cursor.rowcount or 0) > 0
+    result = await db.execute("DELETE FROM metadata_records WHERE id = ?", (record_id,))
+    count = int(result.split()[-1]) if result else 0
+    return count > 0
 
 
 # ---------------------------------------------------------------------------
@@ -237,11 +232,10 @@ async def list_records(
         params.extend(ids)
 
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    cursor = await db.execute(
+    rows = await db.fetch(
         f"SELECT * FROM metadata_records{where} ORDER BY created_at DESC",
         params,
     )
-    rows = await cursor.fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
@@ -266,11 +260,10 @@ async def find_records(
         params.extend([f"%{query}%", f"%{query}%"])
 
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    cursor = await db.execute(
+    rows = await db.fetch(
         f"SELECT * FROM metadata_records{where} ORDER BY updated_at DESC LIMIT 50",
         params,
     )
-    rows = await cursor.fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
@@ -292,9 +285,7 @@ async def link_records(source_id: str, target_id: str) -> dict[str, Any]:
             "INSERT INTO record_links (source_id, target_id, created_at) VALUES (?, ?, ?)",
             (source_id, target_id, now),
         )
-        await db.commit()
     except Exception:
-        # UNIQUE constraint — link already exists
         pass
     return {"source_id": source_id, "target_id": target_id}
 
@@ -302,25 +293,24 @@ async def link_records(source_id: str, target_id: str) -> dict[str, Any]:
 async def get_linked_records(record_id: str) -> list[dict[str, Any]]:
     """Get all records linked to a given record (in either direction)."""
     db = await get_db()
-    cursor = await db.execute(
+    rows = await db.fetch(
         """SELECT m.* FROM metadata_records m
            INNER JOIN record_links l ON (m.id = l.target_id AND l.source_id = ?)
                                      OR (m.id = l.source_id AND l.target_id = ?)""",
         (record_id, record_id),
     )
-    rows = await cursor.fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
 async def unlink_records(source_id: str, target_id: str) -> bool:
     """Remove a link between two records."""
     db = await get_db()
-    cursor = await db.execute(
+    result = await db.execute(
         "DELETE FROM record_links WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)",
         (source_id, target_id, target_id, source_id),
     )
-    await db.commit()
-    return (cursor.rowcount or 0) > 0
+    count = int(result.split()[-1]) if result else 0
+    return count > 0
 
 
 # ---------------------------------------------------------------------------
@@ -330,10 +320,11 @@ async def unlink_records(source_id: str, target_id: str) -> bool:
 async def delete_session(session_id: str) -> bool:
     """Delete all data for a session (conversations and records)."""
     db = await get_db()
-    c1 = await db.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
-    c2 = await db.execute("DELETE FROM metadata_records WHERE session_id = ?", (session_id,))
-    await db.commit()
-    return (c1.rowcount or 0) + (c2.rowcount or 0) > 0
+    r1 = await db.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
+    r2 = await db.execute("DELETE FROM metadata_records WHERE session_id = ?", (session_id,))
+    c1 = int(r1.split()[-1]) if r1 else 0
+    c2 = int(r2.split()[-1]) if r2 else 0
+    return c1 + c2 > 0
 
 
 # ---------------------------------------------------------------------------
@@ -353,17 +344,15 @@ async def save_conversation_turn(
         "INSERT INTO conversations (session_id, role, content, attachments_json) VALUES (?, ?, ?, ?)",
         (session_id, role, content, attachments_json),
     )
-    await db.commit()
 
 
 async def get_conversation_history(session_id: str) -> list[dict[str, Any]]:
     """Retrieve full conversation history for a session."""
     db = await get_db()
-    cursor = await db.execute(
+    rows = await db.fetch(
         "SELECT role, content, attachments_json, created_at FROM conversations WHERE session_id = ? ORDER BY created_at ASC",
         (session_id,),
     )
-    rows = await cursor.fetchall()
     result = []
     for r in rows:
         d = dict(r)
@@ -384,15 +373,19 @@ async def save_upload(
     file_path: str,
     size_bytes: int,
     session_id: str | None = None,
+    initial_status: str = "pending",
 ) -> dict[str, Any]:
-    """Persist an upload record."""
+    """Persist an upload record.
+
+    initial_status: 'pending' for types that need background extraction,
+    'done' for native types (images/PDFs) that are ready immediately.
+    """
     db = await get_db()
     await db.execute(
-        """INSERT INTO uploads (id, original_filename, content_type, file_path, size_bytes, session_id)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (upload_id, original_filename, content_type, file_path, size_bytes, session_id),
+        """INSERT INTO uploads (id, original_filename, content_type, file_path, size_bytes, session_id, extraction_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (upload_id, original_filename, content_type, file_path, size_bytes, session_id, initial_status),
     )
-    await db.commit()
     return {
         "id": upload_id,
         "filename": original_filename,
@@ -404,9 +397,90 @@ async def save_upload(
 async def get_upload(upload_id: str) -> dict[str, Any] | None:
     """Fetch an upload record by ID."""
     db = await get_db()
-    cursor = await db.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,))
-    row = await cursor.fetchone()
+    row = await db.fetchrow("SELECT * FROM uploads WHERE id = ?", (upload_id,))
     return dict(row) if row else None
+
+
+async def set_upload_extraction(
+    upload_id: str,
+    text: str,
+    images: list[tuple[bytes, str]],
+    meta: dict,
+    error: str | None,
+) -> None:
+    """Persist extraction results for an upload.
+
+    Image bytes are base64-encoded for JSON storage:
+    [{"data": <b64 str>, "caption": <str>}, ...].
+    """
+    db = await get_db()
+    images_json = json.dumps([
+        {"data": base64.b64encode(b).decode("ascii"), "caption": cap}
+        for b, cap in images
+    ])
+    meta_json = json.dumps(meta)
+    status = "error" if error else "done"
+    # Database.execute() auto-commits on the SQLite backend and asyncpg
+    # doesn't need explicit commit outside transactions — no .commit() here.
+    await db.execute(
+        """UPDATE uploads
+           SET extracted_text = ?,
+               extracted_images_json = ?,
+               extracted_meta_json = ?,
+               extraction_status = ?,
+               extraction_error = ?
+           WHERE id = ?""",
+        (text, images_json, meta_json, status, error, upload_id),
+    )
+
+
+async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
+    """Fetch extraction results for an upload.
+
+    Returns {"status", "text", "images", "meta", "error"} with images
+    decoded back to [(bytes, caption), ...], or None if the upload
+    doesn't exist.
+    """
+    db = await get_db()
+    row = await db.fetchrow(
+        """SELECT extraction_status, extracted_text, extracted_images_json,
+                  extracted_meta_json, extraction_error
+           FROM uploads WHERE id = ?""",
+        (upload_id,),
+    )
+    if row is None:
+        return None
+
+    images: list[tuple[bytes, str]] = []
+    decode_error: str | None = None
+    raw_images = row["extracted_images_json"]
+    if raw_images:
+        try:
+            for item in json.loads(raw_images):
+                images.append(
+                    (base64.b64decode(item["data"]), item["caption"])
+                )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("Malformed extracted_images_json for upload %s", upload_id)
+            # Surface corruption to caller — don't silently pretend no images existed.
+            decode_error = f"stored image data unreadable: {exc}"
+            images = []
+
+    meta: dict = {}
+    raw_meta = row["extracted_meta_json"]
+    if raw_meta:
+        parsed = _parse_json(raw_meta)
+        if isinstance(parsed, dict):
+            meta = parsed
+
+    stored_error = row["extraction_error"]
+    return {
+        "status": row["extraction_status"],
+        "text": row["extracted_text"],
+        "images": images,
+        "meta": meta,
+        "error": decode_error or stored_error,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +502,6 @@ async def create_artifact(
            VALUES (?, ?, ?, ?, ?, ?)""",
         (artifact_id, session_id, artifact_type, title, _serialize(content), language),
     )
-    await db.commit()
     created = await get_artifact(artifact_id)
     assert created is not None
     return created
@@ -437,8 +510,7 @@ async def create_artifact(
 async def get_artifact(artifact_id: str) -> dict[str, Any] | None:
     """Fetch a single artifact by ID, with content parsed from JSON."""
     db = await get_db()
-    cursor = await db.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
-    row = await cursor.fetchone()
+    row = await db.fetchrow("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
     if row is None:
         return None
     d = dict(row)
@@ -449,11 +521,10 @@ async def get_artifact(artifact_id: str) -> dict[str, Any] | None:
 async def list_artifacts(session_id: str) -> list[dict[str, Any]]:
     """List all artifacts for a session, newest first."""
     db = await get_db()
-    cursor = await db.execute(
+    rows = await db.fetch(
         "SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at DESC",
         (session_id,),
     )
-    rows = await cursor.fetchall()
     result = []
     for row in rows:
         d = dict(row)

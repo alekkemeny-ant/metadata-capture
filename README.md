@@ -5,18 +5,22 @@ A real-time metadata capture and validation platform for the Allen Institute for
 ## Features
 
 - **Conversational capture** — Chat interface where scientists describe experiments in plain language
+- **Multi-modal upload** — Images, PDFs, spreadsheets (CSV/XLSX), text documents, and audio/video (transcribed via whisper.cpp). Folder upload grabs entire directories. Background extraction surfaces progress per-file.
 - **Context-aware extraction** — Agent only asks about metadata relevant to what the user is describing (no irrelevant follow-ups about modality when you're describing a surgery)
 - **Granular records** — Each metadata type (subject, procedures, instrument, session, etc.) is stored as its own record, not lumped into one monolithic entry
 - **Shared vs asset-specific** — Subjects, instruments, procedures, and rigs are reusable across experiments; sessions, acquisitions, and data descriptions are tied to specific data assets
 - **Cross-session linking** — Shared records created in one chat can be found and linked from another chat
-- **Token-by-token streaming** — Real-time SSE streaming with stop button, tool progress indicators with elapsed timers, and model selector (Opus/Sonnet/Haiku)
+- **Background streams** — Switching chats mid-response doesn't abort the stream. A module-level registry keeps writing to its canonical message array + localStorage; switching back re-subscribes and live tokens resume.
+- **Token-by-token streaming** — Real-time SSE streaming with stop button, tool progress indicators with elapsed timers, and top-bar model selector (Opus/Sonnet/Haiku)
 - **Schema-backed validation** — Enum sets (modalities, species, sex) derived from `aind-data-schema` Pydantic models at import time, so they never drift from the canonical schema. Unknown fields trigger warnings.
 - **Inline validation display** — Validation errors and warnings appear directly in the chat tool dropdowns with colored badges (red for errors, amber for warnings), auto-expanded when issues are found
+- **Artifact viewer** — Agent-generated spreadsheets open in a full-screen modal viewer; uploaded CSV/XLSX get an interactive grid preview
 - **Live database validation** — Validates project names, subject IDs, and modalities against AIND's live MongoDB via MCP
 - **Registry validation** — Cross-references Addgene, NCBI GenBank, and MGI databases
-- **Session persistence** — Conversations survive page reloads; a sidebar lets you switch between chats
-- **Dashboard with two views** — Session view groups records by chat session; Library view groups by record type (shared vs asset). Inline editing, field deletion, and schema-guided placeholders
-- **Live health indicator** — Header badge polls the backend and shows Agent Online / Offline in real time
+- **Session persistence** — Conversations survive page reloads; sidebar lets you switch between chats
+- **Dashboard with two views** — Session view groups records by chat session (table on desktop, tappable card stack on mobile); Library view groups by record type (shared vs asset). Inline editing, field deletion, and schema-guided placeholders
+- **Mobile-first responsive** — Unified left rail (slim 52px icon-only ↔ 256px expanded on desktop, overlay drawer on mobile). Full-screen metadata view below a persistent top bar. No horizontal scroll from 375px up.
+- **Live health indicator** — Sidebar pill polls the backend and shows Agent Online / Offline in real time
 
 ## Architecture
 
@@ -24,7 +28,7 @@ The system has three components:
 
 1. **Agent backend** (`agent/`) — Python service using the Claude Agent SDK, wrapped in FastAPI. Streams token-by-token via `include_partial_messages` + `StreamEvent`. Three MCP tools for metadata capture: `capture_metadata` (one record type per call), `find_records` (search existing shared records), and `link_records` (associate related records). Stores records, links, and conversation history in SQLite.
 
-2. **Web frontend** (`frontend/`) — Next.js 14 app with TypeScript and Tailwind CSS. Three-pane layout: sessions sidebar, token-streaming chat panel with model selector, and metadata sidebar grouped by record type. Dashboard page with session/library view toggle and inline editing.
+2. **Web frontend** (`frontend/`) — Next.js 14 app with TypeScript and Tailwind CSS. Unified left sidebar (brand + nav + sessions + agent status) that collapses to a slim icon rail on desktop and becomes an overlay drawer on mobile. Top bar hosts the model selector; chat body streams token-by-token; metadata panel on the right (desktop) or as a full-screen toggle view (mobile). Dashboard page with session/library toggle and inline editing.
 
 3. **AIND MCP server** (`aind-metadata-mcp/`) — MCP server with 20 tools for read-only access to AIND's live metadata MongoDB (hosted at `api.allenneuraldynamics.org`). Connected to the agent via stdio transport.
 
@@ -85,7 +89,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. The frontend connects to the backend at `localhost:8001` by default (configurable via `NEXT_PUBLIC_API_URL`).
+Open `http://localhost:5000`. With `NEXT_PUBLIC_API_URL` unset (the default in dev), Next.js's `rewrites()` proxy all `/chat`, `/records`, `/sessions`, etc. to the backend at `localhost:8001` server-side — so if you're port-forwarding, only port 5000 is needed.
 
 ## Database Schema
 
@@ -139,7 +143,10 @@ python3 -m pytest evals/tasks/validation/ -v -m network
 - [x] Auto-trigger registry lookups when relevant fields are extracted
 - [x] Validation feedback loop into agent conversation for proactive prompting
 - [x] Deeper schema validation via `aind-data-schema` Pydantic models
-- [ ] Multi-modal input (audio recordings, images of lab notebooks, documents)
+- [x] Multi-modal input (images, PDFs, CSV/XLSX spreadsheets, text docs, audio/video via whisper transcription)
+- [x] Mobile-responsive layout (overlay sidebar drawer, full-screen metadata view, card-stack dashboard)
+- [x] Background streams (switching chats doesn't abort in-flight responses)
+- [x] Artifact viewer (agent-generated and uploaded spreadsheets)
 - [ ] MCP write access to AIND MongoDB
-- [ ] Cloud deployment
+- [ ] Cloud deployment (Replit autoscale configured; PostgreSQL support pending PR #5)
 - [ ] Authentication (Allen SSO)

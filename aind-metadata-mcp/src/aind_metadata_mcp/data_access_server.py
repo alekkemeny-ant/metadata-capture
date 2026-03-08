@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 from urllib.parse import urlparse
 
-import boto3
 from aind_data_access_api.document_db import MetadataDbClient
 from fastmcp import FastMCP
-from hdmf_zarr import NWBZarrIO
-from suffix_trees import STree
+# boto3, hdmf_zarr, suffix_trees are only used by the two
+# identify_nwb_contents_* tools — moved to lazy imports inside those
+# bodies. Together they cost ~660ms of cold-start, which is paid on
+# every subprocess spawn regardless of whether the capture workflow
+# ever calls them (it doesn't).
 
 mcp = FastMCP("aind_data_access")
 
@@ -239,6 +241,7 @@ def identify_nwb_contents_in_code_ocean(subject_id, date):
     print(f"Found second-level directory: {nwb_path.name}")
 
     # Check if path exists and load NWB file
+    from hdmf_zarr import NWBZarrIO  # lazy: ~530ms cold
     try:
         with NWBZarrIO(str(nwb_path), "r") as io:
             nwbfile = io.read()
@@ -268,7 +271,13 @@ def identify_nwb_contents_with_s3_link(s3_link):
     bucket_name = parsed_url.netloc
     prefix = parsed_url.path.lstrip("/")
 
-    # Initialize S3 client
+    # Initialize S3 client — all three imports lazy: boto3 ~127ms,
+    # hdmf_zarr ~530ms, suffix_trees ~0ms. Only paid if this tool is
+    # actually called (capture workflow never does).
+    import boto3
+    from hdmf_zarr import NWBZarrIO
+    from suffix_trees import STree
+
     s3 = boto3.client("s3")
 
     try:

@@ -108,6 +108,20 @@ export async function fetchUploadTable(fileId: string): Promise<SpreadsheetData>
   return res.json();
 }
 
+export interface UploadExtraction {
+  status: 'pending' | 'done' | 'error';
+  text_preview: string;
+  meta: Record<string, unknown>;
+  error: string | null;
+  image_count: number;
+}
+
+export async function getUploadExtraction(fileId: string): Promise<UploadExtraction> {
+  const res = await fetch(`${API_BASE}/uploads/${fileId}/extraction`);
+  if (!res.ok) throw new Error(`extraction fetch failed: ${res.status}`);
+  return res.json();
+}
+
 export async function fetchArtifact(artifactId: string): Promise<Artifact> {
   const res = await fetch(`${API_BASE}/artifacts/${artifactId}`);
   if (!res.ok) throw new Error(`Failed to fetch artifact: ${res.status}`);

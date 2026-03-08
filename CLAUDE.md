@@ -15,7 +15,7 @@ Build a real-time metadata capture and validation platform for AIND using the **
 - **Dashboard** with session view + library view for reviewing and confirming metadata
 - **Local SQLite** for metadata storage (future: AIND MongoDB write access)
 
-Multi-modal (audio, image, video) deferred to post-MVP.
+Multi-modal (images, PDFs, text, spreadsheets, DOCX, audio, video) implemented via upload-time extraction pipeline.
 
 ---
 
@@ -80,9 +80,12 @@ metadata-capture/
 │   ├── prompts/
 │   │   └── system_prompt.py        # Context-aware AIND schema + granular record instructions
 │   ├── tools/
-│   │   ├── metadata_store.py       # SQLite CRUD: records, links, sessions, conversations
+│   │   ├── metadata_store.py       # SQLite CRUD: records, links, sessions, conversations, uploads
 │   │   ├── capture_mcp.py          # MCP tools: capture_metadata, find_records, link_records
-│   │   └── registry_lookup.py      # Addgene, NCBI, MGI API wrappers
+│   │   ├── registry_lookup.py      # Addgene, NCBI, MGI API wrappers
+│   │   ├── extractors.py           # Upload extraction registry: text/spreadsheet/docx/audio/video → ExtractedContent
+│   │   ├── transcribe.py           # whisper.cpp subprocess wrapper: ffmpeg → 16kHz WAV → whisper-cli → transcript
+│   │   └── spreadsheet.py          # CSV/XLSX parse → {columns, rows, total_rows}
 │   ├── db/
 │   │   ├── database.py             # Async SQLite (aiosqlite, WAL mode)
 │   │   └── models.py               # DDL: metadata_records + record_links + conversations
@@ -90,14 +93,18 @@ metadata-capture/
 │
 ├── frontend/                       # Next.js 14 + TypeScript + Tailwind CSS
 │   ├── app/
-│   │   ├── page.tsx                # Three-pane layout: sessions sidebar | chat | metadata sidebar
-│   │   ├── dashboard/page.tsx      # Dashboard with session view + library view toggle
+│   │   ├── page.tsx                # Layout: AppSidebar | (top-bar + chat) | MetadataSidebar (desktop)
+│   │   ├── dashboard/page.tsx      # AppSidebar | session/library toggle (table on desktop, card stack on mobile)
 │   │   ├── components/
-│   │   │   ├── Header.tsx          # Shared nav bar + live Agent Online/Offline health indicator
-│   │   │   ├── ChatPanel.tsx       # Token-streaming chat, model selector, tool progress indicators
-│   │   │   ├── SessionsSidebar.tsx # Chat history list with first-message titles
-│   │   │   └── MetadataSidebar.tsx # Records grouped by type (shared/asset) with status badges
-│   │   └── lib/api.ts              # API client: chat (SSE + AbortSignal), metadata CRUD, sessions
+│   │   │   ├── AppSidebar.tsx      # Unified left rail: brand + nav + sessions + agent status
+│   │   │   │                       #   Desktop: slim 52px ↔ 256px expanded. Mobile: overlay drawer.
+│   │   │   ├── SidebarContext.tsx  # isExpanded / isMobile via matchMedia, localStorage persistence
+│   │   │   ├── ModelPicker.tsx     # Model selector — rendered in top bar (state owned by page.tsx)
+│   │   │   ├── ChatPanel.tsx       # Token-streaming chat, background-stream registry, tool indicators
+│   │   │   ├── MetadataSidebar.tsx # Records grouped by type (shared/asset) with status badges
+│   │   │   ├── ArtifactModal.tsx   # Full-screen viewer for agent-generated artifacts
+│   │   │   └── SpreadsheetViewer.tsx # Interactive grid for CSV/XLSX uploads + artifact tables
+│   │   └── lib/api.ts              # API client: chat (SSE + AbortSignal), records CRUD, uploads, sessions
 │   └── package.json
 │
 ├── evals/                          # Eval suite: 64 deterministic + 11 LLM-graded + 10 agent e2e
@@ -160,24 +167,25 @@ Three MCP tools for metadata capture:
 - Token-by-token SSE streaming via SDK `include_partial_messages` + `StreamEvent` deltas
 - Stop button aborts the stream mid-response via `AbortController`
 - Auto-expanding textarea (no height cap); send button is an up-arrow icon inside the input
-- Sessions sidebar lists all chats by first-message preview; click to switch, "New Chat" to start fresh
+- Sessions list in the unified `AppSidebar`; click to switch, "New Chat" to start fresh
 - Conversation history persists across page reloads (loaded from `GET /sessions/{id}/messages`)
 - Side panel with extracted metadata fields, expandable JSON sections
 - Metadata cards in the sidebar are clickable — navigate to the dashboard entry
-- Auto-refresh, status badges, mobile-responsive
+- **Background streams**: switching chats mid-response doesn't abort. Module-level stream registry keeps writing to its canonical messages array + localStorage; switching back re-subscribes and live tokens resume.
+- Auto-refresh, status badges
 
 ### Phase 5: Frontend — Dashboard ✅
 **Files:** `frontend/app/dashboard/page.tsx`
 
-- **Session view**: table grouped by chat session, expandable rows showing per-session records
+- **Session view**: `table-fixed` table with locked column widths on desktop; tappable card stack on mobile. Expandable rows show per-session records.
 - **Library view**: records grouped by type (Shared: subjects, procedures, instruments, rigs; Asset: sessions, etc.)
 - Toggle between views with a segmented control
 - **Inline editing**: click any value to edit; saves on Enter or blur
-- **Delete fields**: trash icon on hover
+- **Delete fields**: trash icon on hover (always visible on touch devices)
 - **Add fields**: `+ Add field` row at the bottom of every record
 - **Schema placeholders**: known fields shown as "click to add" rows
-- Confirm individual records, filter by status, search
-- Shared `Header` with live Agent Online / Offline indicator (polls `/health` every 5 s)
+- Confirm individual records, filter by status, search (`visibleSessions` filter hides sessions whose records were all filtered out)
+- Agent Online / Offline indicator lives in `AppSidebar` (polls `/health` every 5 s)
 
 ### Phase 6: Streaming & UX Polish ✅
 **Files:** `agent/service.py`, `frontend/app/components/ChatPanel.tsx`, `frontend/tailwind.config.ts`
@@ -188,6 +196,27 @@ Three MCP tools for metadata capture:
 - Tool dropdowns show inline validation results: red X for errors, amber triangle for warnings
 - `capture_metadata` tool results auto-expand when validation issues are found
 - Validation streamed to frontend via `tool_result` SSE events (async queue piped from MCP tool handler)
+
+### Phase 7: Mobile + Unified Sidebar Refactor ✅
+**Files:** `frontend/app/components/AppSidebar.tsx`, `SidebarContext.tsx`, `ModelPicker.tsx`, `page.tsx`, `dashboard/page.tsx`, `layout.tsx`
+
+- **AppSidebar** replaces `Header.tsx` + `SessionsSidebar.tsx`. Brand + nav + sessions + agent status in one left rail. Desktop: slim 52px icon-only ↔ 256px expanded (persisted to localStorage). Mobile: hidden by default, opens as `fixed` overlay drawer with backdrop.
+- **SidebarContext**: `isMobile` via `matchMedia('(max-width: 767px)')` (matches Tailwind's `md:` breakpoint). `closeSidebarOnMobile()` called by nav link clicks. Escape key closes the mobile drawer.
+- **ModelPicker**: lifted out of ChatPanel's bottom-left corner into the top bar. State owned by `page.tsx` so both the picker UI and `sendChatMessage()` see the same value.
+- **Mobile metadata view**: full-screen overlay below the top bar (not a partial-width drawer). Document icon in top bar is the sole toggle — stays visible when open.
+- **Dashboard mobile**: toolbar wraps (hamburger + view toggle → status filters → search on its own row). Session table is `hidden md:table`; a `md:hidden` sibling renders tappable cards with the same expand logic.
+- **Touch targets**: hover-only delete buttons now `opacity-100 md:opacity-0 md:group-hover:opacity-100` — always visible on touch, hover-revealed on desktop.
+- **`viewport` export** added to `layout.tsx` — without it mobile browsers render at ~980px desktop width.
+
+### Phase 8: Multimodal Upload + Extraction Pipeline ✅
+**Files:** `agent/tools/extractors.py`, `agent/tools/transcribe.py`, `agent/server.py`, `agent/service.py`, `frontend/app/components/ChatPanel.tsx`
+
+- **Upload-time extraction**: `POST /upload` accepts 22 MIME types + 19 extensions (100 MB cap). Non-native types schedule `asyncio.create_task(_extract_and_store(...))` after the 200 response — single-worker uvicorn never blocks on transcription.
+- **Extractor registry** (`@register` decorator): text/md/json/yaml (read+truncate), CSV/XLSX (markdown table, first 100 rows), DOCX (python-docx paragraphs), audio (ffmpeg→whisper.cpp transcript), video (transcript + 3 keyframes via ffmpeg `-ss` fast-seek).
+- **whisper.cpp integration**: `ffmpeg -ar 16000 -ac 1` normalizes to mono WAV → `whisper-cli` runs STT. Both expected on `$PATH`. Model (`ggml-base.en.bin`, ~140MB) downloaded via `scripts/download_whisper_model.sh`. `/health` reports availability; audio/video uploads 503 if missing.
+- **`GET /uploads/{id}/extraction`**: `{status: pending|done|error, text_preview, meta, image_count}`. Frontend polls this 1s/10x after upload; shows "processing…" chip until done.
+- **Chat-time**: `_build_multimodal_content` reads cached extraction from DB. Images/PDFs still base64'd directly to Claude; everything else injected as text + video keyframes as image blocks.
+- **Frontend**: removed client-side type filter (server validates), file-type icon chips (🎵🎬📊📄📝), expanded `<input accept>`.
 
 ---
 
@@ -200,15 +229,20 @@ Three MCP tools for metadata capture:
 | Frontend | Next.js 14 + TypeScript + Tailwind | App Router, SSE streaming, mobile-responsive |
 | API layer | FastAPI wrapping SDK `query()` | Async streaming, Python ecosystem match |
 | Local DB | SQLite via aiosqlite | Zero-config MVP, WAL mode for concurrency |
-| Model | claude-opus-4-6 | Most capable for complex metadata extraction |
+| Model | claude-sonnet-4-6 | Matches Opus on agent evals (24/24) at ~5× lower cost, ~2s TTFT |
 | Streaming | SDK `include_partial_messages` + `StreamEvent` | Token-by-token deltas without buffering full messages |
 | Stop streaming | `AbortController` + `AbortSignal` on fetch | Cleanly closes SSE connection; partial response stays visible |
 | Metadata granularity | One record per type (shared vs asset) | Context-aware capture; no irrelevant follow-ups |
 | Record linking | Explicit `record_links` table | Cross-session reuse of subjects, instruments, rigs |
 | Inline editing | Per-record PUT endpoint | Auto-saves on blur, no full-page reload |
 | Session titles | First user message from DB | Matches Claude desktop UX; no extra LLM call needed |
+| Sidebar pattern | Slim rail ↔ expanded, mobile overlay drawer | Patterned after claude.ai's SidebarNav — icons-only collapsed rail, backdrop drawer on mobile, CSS transitions (no framer-motion) |
+| Mobile breakpoint | `md` (768px) for both CSS and JS | `matchMedia` uses the same 767px threshold as Tailwind's `md:` so responsive classes and JS behavior never disagree |
+| Background streams | Module-level registry (keyed Map + subscriber Set) | Claude.ai keyed-store pattern. Stream owns its canonical messages array; switching sessions unsubscribes but leaves the stream running; switching back finds the entry and re-subscribes |
 | Schema validation | `aind-data-schema` Pydantic introspection | Canonical enums + unknown-field checks, no hardcoded drift |
 | Validation display | `tool_result` SSE + `contextvars` queue | Tool handler pushes results; stream drains them inline |
+| Upload extraction timing | Upload-time background task (not chat-time) | Single-worker uvicorn would stall all users for 120s during transcription |
+| Audio/video transcription | `ffmpeg` + `whisper.cpp` binaries on `$PATH` | No Python ML stack (no torch), no external API cost, no keys to manage |
 | Auth | None for MVP | Add Allen SSO later |
 
 ---
@@ -224,8 +258,14 @@ python3 -m uvicorn agent.server:app --port 8001 --reload  # auto-reloads on file
 npm install
 npm run dev                                                # auto-reloads on file save
 
+# Optional: audio/video transcription (for .mp3/.wav/.mp4/.mov uploads)
+# macOS:  brew install ffmpeg whisper-cpp
+# Replit: add pkgs.ffmpeg + pkgs.whisper-cpp to replit.nix
+./scripts/download_whisper_model.sh                               # ~140MB, one-time
+
 # Run evals (from metadata-capture/ directory)
-python3 -m pytest evals/ -q -m "not llm and not network"          # deterministic only
+python3 -m pytest evals/ -q -m "not llm and not network and not binary"  # deterministic only
+python3 -m pytest evals/tasks/extraction/ -v -m binary             # transcription tests (needs ffmpeg + whisper-cli)
 python3 -m pytest evals/tasks/conversation/ -v -m llm              # LLM-graded transcripts (needs ANTHROPIC_API_KEY)
 python3 -m pytest evals/tasks/agent/ -v -m llm                     # end-to-end agent evals (needs ANTHROPIC_API_KEY)
 python3 -m pytest evals/tasks/validation/ -v -m network            # registry lookups (needs network)
@@ -245,11 +285,34 @@ npm test                                                           # vitest: ove
 - **Browser verification on homespace**: Use `chromium-cli` (pre-installed). `.click()` doesn't bubble — use `dispatchEvent(new MouseEvent('click', {bubbles: true}))` for React handlers. `window.__openArtifact` (dev only) opens the artifact modal programmatically.
 - **Stale tests**: `evals/tasks/end_to_end/cases.yaml:14,37` hit `/metadata` (doesn't exist — endpoint is `/records`). 2 tests always fail.
 
+## Performance (TTFT / streaming latency)
+
+The SDK's `query()` spawns a fresh `claude` CLI subprocess per chat request, which in turn spawns stdio MCP subprocesses. This is the dominant TTFT cost. Mitigations applied:
+
+- `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK=1` in `server.py` — skips the `claude -v` version check subprocess (~2.3s per request).
+- AIND MCP spawned via `python -m aind_metadata_mcp.data_access_server` with `PYTHONPATH` pointed at the vendored `aind-metadata-mcp/src/` instead of the `aind-metadata-mcp` CLI entrypoint. The CLI was crashing with `ModuleNotFoundError` when its editable-install `.pth` pointed at a moved directory; the `claude` CLI would then retry with backoff, adding 25–30s before giving up. The direct-module spawn can't break this way.
+- Lazy-imported `boto3` / `hdmf_zarr` / `suffix_trees` inside the two NWB tools in `data_access_server.py` — shaves ~660ms off MCP cold start. The capture workflow never calls these tools.
+- Dropped unused tools from `allowed_tools`: `count_records`, `aggregation_retrieval`, `get_summary`, `flatten_records`, `identify_nwb_contents_*` — saves ~1000 tokens of tool schema per API turn.
+- `CHAT_PROFILE=1` env var enables per-stage latency logging (context gather → query() iter → first text delta → ResultMessage).
+
+**Persistent SDK client pool** (`agent/sdk_client_pool.py`): a background task owns a warm `ClaudeSDKClient`, eliminating the ~4s subprocess spawn on requests 2+. The SDK's async-context binding restriction (client's anyio TaskGroup tied to where `connect()` was called) means we can't share a client across FastAPI handlers directly — instead the worker task exchanges messages with handlers via `asyncio.Queue`. The `stream_events` contextvar (capture_metadata validation results) is bridged by having the worker set its own queue and forward events as `{"tool_event": ...}` dicts interleaved in the output.
+
+Current numbers (Haiku, minimal prompt, pool warm): **TTFT ~0.8s**, first iter ~20ms. First request after startup still pays ~2s (API prompt-cache cold).
+
+Env vars:
+- `USE_SDK_POOL=0` — disable pool, fall back to per-request `query()` (~4s slower)
+- `CHAT_PROFILE=1` — per-stage latency logging
+- `AIND_MCP_PYTHON` — override the Python used for AIND MCP (must have `aind-data-access-api` + `fastmcp`)
+- `SKIP_AIND_MCP=1` — disable AIND MCP entirely for perf isolation
+
 ---
 
 ## Future Work
-- Multi-modal input (audio, image, video, documents)
+- **AIND MCP as HTTP/SSE** — run `fastmcp` in `transport="http"` mode as a long-lived daemon; CLI connects over socket instead of stdio spawn. Would further shave warmup (pool still has to spawn the stdio MCP on reconnect).
+- **Pool auto-reconnect** — currently a failed query clears `is_warm` and callers fall back to `query()`. A fancier pool would reconnect transparently.
 - MCP write access to AIND MongoDB
 - Cloud deployment (Cloud Run)
 - Allen SSO authentication
-- Performance optimization (concurrent users, token efficiency)
+- DOCX embedded images (convert-to-PDF path)
+- Non-English transcription (currently base.en model only)
+- Task drain-on-shutdown (extraction tasks stuck at `pending` if server restarts mid-run)
