@@ -586,7 +586,7 @@ async def get_sessions() -> list[dict[str, Any]]:
     from .db.database import get_db
 
     db = await get_db()
-    cursor = await db.execute(
+    rows = await db.fetch(
         """
         SELECT
             session_id,
@@ -605,5 +605,4 @@ async def get_sessions() -> list[dict[str, Any]]:
         ORDER BY MAX(created_at) DESC
         """
     )
-    rows = await cursor.fetchall()
     return [dict(r) for r in rows]
