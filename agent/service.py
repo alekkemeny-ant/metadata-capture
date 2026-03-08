@@ -507,8 +507,12 @@ async def chat(
     if records:
         prompt += _format_records_context(records)
 
-    # Add session_id context for the capture tools
-    prompt += f"\n\nIMPORTANT: When calling capture_metadata, always use session_id=\"{session_id}\""
+    # Add session_id context for the capture tools — the agent doesn't know the
+    # session_id otherwise, and the tool handlers hard-require it.
+    prompt += (
+        f"\n\nIMPORTANT: When calling capture_metadata, find_records, link_records, "
+        f"or render_artifact, always use session_id=\"{session_id}\""
+    )
 
     # Build multimodal content if attachments are present. Upload rows were
     # already fetched concurrently above; zip them back onto the attachment
