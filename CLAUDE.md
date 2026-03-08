@@ -260,13 +260,28 @@ python3 -m pytest evals/tasks/validation/ -v -m network            # registry lo
 - **Tool-based extraction**: Regex extraction has been replaced with Claude tool calls. The old regex bugs (project name, session end time, protocol ID) are no longer applicable.
 - **Python version**: The backend uses `X | Y` union type syntax, which requires Python 3.10+. Any Python ≥ 3.10 works — no conda needed.
 
+## Performance (TTFT / streaming latency)
+
+The SDK's `query()` spawns a fresh `claude` CLI subprocess per chat request, which in turn spawns stdio MCP subprocesses. This is the dominant TTFT cost. Mitigations applied:
+
+- `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK=1` in `server.py` — skips the `claude -v` version check subprocess (~2.3s per request).
+- AIND MCP spawned via `python -m aind_metadata_mcp.data_access_server` with `PYTHONPATH` pointed at the vendored `aind-metadata-mcp/src/` instead of the `aind-metadata-mcp` CLI entrypoint. The CLI was crashing with `ModuleNotFoundError` when its editable-install `.pth` pointed at a moved directory; the `claude` CLI would then retry with backoff, adding 25–30s before giving up. The direct-module spawn can't break this way.
+- Lazy-imported `boto3` / `hdmf_zarr` / `suffix_trees` inside the two NWB tools in `data_access_server.py` — shaves ~660ms off MCP cold start. The capture workflow never calls these tools.
+- Dropped unused tools from `allowed_tools`: `count_records`, `aggregation_retrieval`, `get_summary`, `flatten_records`, `identify_nwb_contents_*` — saves ~1000 tokens of tool schema per API turn.
+- `CHAT_PROFILE=1` env var enables per-stage latency logging (context gather → query() iter → first text delta → ResultMessage).
+
+Current numbers (Haiku, minimal prompt): ~4s to first iter, ~5-6s TTFT. The remaining ~4s is CLI subprocess spawn and cannot be eliminated without switching to a persistent `ClaudeSDKClient` — see "Future Work".
+
+`AIND_MCP_PYTHON` env var overrides the Python used to run the AIND MCP (must have `aind-data-access-api` + `fastmcp` installed). `SKIP_AIND_MCP=1` disables the server entirely for perf testing.
+
 ---
 
 ## Future Work
+- **Persistent `ClaudeSDKClient` per chat session** — would eliminate the ~4s CLI subprocess spawn on every request after the first. SDK v0.1.22 has an async-context binding restriction (client's anyio task group is tied to the context where `connect()` was called), so this needs a background task per session that owns the client and exchanges messages via `asyncio.Queue`. See SDK `client.py:55-62`.
+- **AIND MCP as HTTP/SSE** — run `fastmcp` in `transport="http"` mode as a long-lived daemon; CLI connects over socket instead of stdio spawn. Less architectural than ClaudeSDKClient but shaves the MCP startup entirely.
 - MCP write access to AIND MongoDB
 - Cloud deployment (Cloud Run)
 - Allen SSO authentication
-- Performance optimization (concurrent users, token efficiency)
 - DOCX embedded images (convert-to-PDF path)
 - Non-English transcription (currently base.en model only)
 - Task drain-on-shutdown (extraction tasks stuck at `pending` if server restarts mid-run)

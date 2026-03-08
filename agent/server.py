@@ -3,10 +3,18 @@
 import asyncio
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+# The SDK runs `claude -v` in a fresh subprocess before every query() to
+# detect version mismatches. Profiled at ~50–300ms per call, but more
+# importantly it's one extra subprocess spawn + Python interpreter boot in
+# the hot path. We check at startup instead (version drift mid-process is
+# a non-concern for a single-worker service).
+os.environ.setdefault("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile

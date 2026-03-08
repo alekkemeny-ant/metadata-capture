@@ -4,6 +4,8 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,11 @@ from .tools.metadata_store import (
 
 logger = logging.getLogger(__name__)
 
+# Set CHAT_PROFILE=1 to log per-stage latency (context gather, query() iter,
+# first text delta). Kept off by default — time.perf_counter() is cheap but
+# the extra log lines clutter output.
+_PROFILE = os.environ.get("CHAT_PROFILE") == "1"
+
 # Path to the AIND MCP server for schema context
 MCP_SERVER_DIR = Path(__file__).resolve().parent.parent / "aind-metadata-mcp"
 
@@ -44,11 +51,16 @@ AVAILABLE_MODELS = [
 
 def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     """Build the ClaudeAgentOptions for the metadata agent."""
-    # MCP tool names are prefixed with "mcp__<server-name>__"
+    # MCP tool names are prefixed with "mcp__<server-name>__".
+    # Trimmed from 20 → 13: dropped count_records, aggregation_retrieval,
+    # get_summary, flatten_records, and the two identify_nwb_contents_*
+    # (which pull in hdmf_zarr + boto3 — ~660ms of MCP startup). These
+    # are browse/NWB-inspection tools; the capture workflow never calls
+    # them. The get_*_example tools stay — system_prompt.py points the
+    # agent at them for schema reference. Saves ~1000 tokens of tool
+    # schemas per API turn.
     aind_mcp_tools = [
         "mcp__aind-metadata-mcp__get_records",
-        "mcp__aind-metadata-mcp__count_records",
-        "mcp__aind-metadata-mcp__aggregation_retrieval",
         "mcp__aind-metadata-mcp__get_project_names",
         "mcp__aind-metadata-mcp__get_modality_types",
         "mcp__aind-metadata-mcp__get_subject_example",
@@ -61,11 +73,6 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
         "mcp__aind-metadata-mcp__get_quality_control_example",
         "mcp__aind-metadata-mcp__get_rig_example",
         "mcp__aind-metadata-mcp__get_top_level_nodes",
-        "mcp__aind-metadata-mcp__get_additional_schema_help",
-        "mcp__aind-metadata-mcp__get_summary",
-        "mcp__aind-metadata-mcp__flatten_records",
-        "mcp__aind-metadata-mcp__identify_nwb_contents_in_code_ocean",
-        "mcp__aind-metadata-mcp__identify_nwb_contents_with_s3_link",
     ]
 
     # Capture tools (capture_metadata, find_records, link_records, render_artifact)
@@ -81,16 +88,34 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
         "capture": capture_server,
     }
 
-    # Add AIND MCP server if available
-    mcp_config_path = MCP_SERVER_DIR / "mcp_config.json"
-    if mcp_config_path.exists():
-        import shutil
-
-        mcp_command = shutil.which("aind-metadata-mcp") or "aind-metadata-mcp"
-        logger.info("Registering AIND MCP server: %s", mcp_command)
+    # Add AIND MCP server if available. SKIP_AIND_MCP=1 disables it for
+    # perf testing — the stdio subprocess spawn is the dominant TTFT cost.
+    #
+    # Previously this called the `aind-metadata-mcp` CLI entrypoint. That
+    # broke silently when the editable install's .pth file pointed at a
+    # moved directory — the CLI would ModuleNotFoundError on startup and
+    # the claude CLI would retry with backoff, adding 25–30s of latency
+    # before giving up. Running the module directly with PYTHONPATH set
+    # to our vendored source (a) can't break that way, (b) picks up our
+    # lazy-import fix (~600ms off cold start), (c) makes the failure mode
+    # obvious: if AIND_MCP_PYTHON doesn't have the deps, the backend
+    # crashes at startup instead of every chat being mysteriously slow.
+    #
+    # AIND_MCP_PYTHON: path to a Python that has aind-data-access-api +
+    # fastmcp installed. Defaults to the system conda py311 env that was
+    # already hosting the editable install.
+    mcp_src = MCP_SERVER_DIR / "src"
+    if mcp_src.is_dir() and os.environ.get("SKIP_AIND_MCP") != "1":
+        mcp_python = os.environ.get(
+            "AIND_MCP_PYTHON",
+            "/opt/homebrew/Caskroom/miniforge/base/envs/py311/bin/python3",
+        )
+        logger.info("Registering AIND MCP server via %s (src=%s)", mcp_python, mcp_src)
         mcp_servers["aind-metadata-mcp"] = {
             "type": "stdio",
-            "command": mcp_command,
+            "command": mcp_python,
+            "args": ["-m", "aind_metadata_mcp.data_access_server"],
+            "env": {"PYTHONPATH": str(mcp_src)},
         }
 
     opts = ClaudeAgentOptions(
@@ -291,6 +316,9 @@ async def chat(
     - {"session_id": str} sent once at the start
     - {"done": True} when complete
     """
+    t0 = time.perf_counter() if _PROFILE else 0.0
+    _t = lambda: (time.perf_counter() - t0) * 1000  # ms since chat() start  # noqa: E731
+
     # Save the user's message (with attachment metadata if present)
     attachment_meta = None
     if attachments:
@@ -303,6 +331,8 @@ async def chat(
     # Send session_id first so the frontend can set up its UI state while
     # we're still gathering context below.
     yield {"session_id": session_id}
+    if _PROFILE:
+        print(f"[profile] +{_t():.0f}ms: session_id yielded", flush=True)
 
     # History + records + attachment lookups are independent reads — run them
     # concurrently. TTFT is dominated by the MCP subprocess spawn inside
@@ -319,6 +349,8 @@ async def chat(
         get_session_records(session_id),
         _resolve_uploads(),
     )
+    if _PROFILE:
+        print(f"[profile] +{_t():.0f}ms: context gathered (history={len(history)} records={len(records)} uploads={len(uploads)})", flush=True)
 
     # Build conversation context
     prior_history = history[:-1] if history else []
@@ -350,9 +382,16 @@ async def chat(
     else:
         prompt_content = prompt
 
+    if _PROFILE:
+        prompt_len = len(prompt_content) if isinstance(prompt_content, str) else sum(
+            len(b.get("text", "")) if isinstance(b, dict) else 0 for b in prompt_content
+        )
+        print(f"[profile] +{_t():.0f}ms: prompt built ({prompt_len} chars, ~{prompt_len // 4} tokens)", flush=True)
+
     # Run the agent with streaming input (required for custom MCP tools)
     options = _get_options(model)
     full_response: list[str] = []
+    first_delta_logged = False
 
     # Track how much text was streamed via deltas so we can detect
     # AssistantMessages whose text wasn't streamed (e.g. post-tool turns).
@@ -366,7 +405,13 @@ async def chat(
     last_render_tool_use_id: str | None = None
 
     try:
+        if _PROFILE:
+            print(f"[profile] +{_t():.0f}ms: entering query() — subprocess spawn starts here", flush=True)
+        _first_iter = True
         async for message in query(prompt=_create_message_stream(prompt_content), options=options):
+            if _PROFILE and _first_iter:
+                print(f"[profile] +{_t():.0f}ms: first message from query() iterator (type={type(message).__name__})", flush=True)
+                _first_iter = False
             # Drain any pending events pushed by tool handlers. These arrive
             # after the tool executes (between the tool_use AssistantMessage
             # and the next text response).
@@ -409,6 +454,9 @@ async def chat(
                     delta_type = delta.get("type")
                     if delta_type == "text_delta":
                         text = delta["text"]
+                        if _PROFILE and not first_delta_logged:
+                            print(f"[profile] +{_t():.0f}ms: FIRST TEXT DELTA ({len(text)} chars) — this is TTFT", flush=True)
+                            first_delta_logged = True
                         full_response.append(text)
                         yield {"content": text}
                     elif delta_type == "thinking_delta":
@@ -444,6 +492,10 @@ async def chat(
                 streamed_len_before_msg = len(full_response)
 
             elif isinstance(message, ResultMessage):
+                if _PROFILE:
+                    out_chars = sum(len(s) for s in full_response)
+                    otps = (out_chars / 4) / (message.duration_ms / 1000) if message.duration_ms else 0
+                    print(f"[profile] +{_t():.0f}ms: ResultMessage (turns={message.num_turns} sdk_duration={message.duration_ms}ms out={out_chars} chars ~{out_chars // 4} tok, OTPS~{otps:.1f} tok/s)", flush=True)
                 logger.info(
                     "Query complete: %d turns, %s ms",
                     message.num_turns,
