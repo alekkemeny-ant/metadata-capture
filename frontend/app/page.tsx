@@ -34,6 +34,16 @@ export default function Home() {
     if (isMobile && isExpanded) setMetadataOpen(false);
   }, [isMobile, isExpanded]);
 
+  // Escape closes the mobile metadata drawer (a11y parity with sidebar drawer).
+  useEffect(() => {
+    if (!isMobile || !metadataOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMetadataOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isMobile, metadataOpen]);
+
   const checkHealth = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(3000) });

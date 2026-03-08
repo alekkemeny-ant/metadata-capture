@@ -80,6 +80,16 @@ export function SidebarProvider({ children }: { children: ReactNode }) {
     if (isMobile) setIsExpandedState(false);
   }, [isMobile]);
 
+  // Escape closes the mobile drawer — standard a11y expectation for overlays.
+  useEffect(() => {
+    if (!isMobile || !isExpanded) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setIsExpandedState(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isMobile, isExpanded]);
+
   const value = useMemo(() => ({
     isExpanded, setIsExpanded, isMobile, closeSidebarOnMobile, hasMeasured,
   }), [isExpanded, setIsExpanded, isMobile, closeSidebarOnMobile, hasMeasured]);
