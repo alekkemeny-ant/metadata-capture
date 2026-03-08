@@ -41,11 +41,11 @@ _PROFILE = os.environ.get("CHAT_PROFILE") == "1"
 MCP_SERVER_DIR = Path(__file__).resolve().parent.parent / "aind-metadata-mcp"
 
 
-DEFAULT_MODEL = "claude-opus-4-6"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 
 AVAILABLE_MODELS = [
     "claude-opus-4-6",
-    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
 ]
 

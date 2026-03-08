@@ -213,7 +213,7 @@ Three MCP tools for metadata capture:
 | Frontend | Next.js 14 + TypeScript + Tailwind | App Router, SSE streaming, mobile-responsive |
 | API layer | FastAPI wrapping SDK `query()` | Async streaming, Python ecosystem match |
 | Local DB | SQLite via aiosqlite | Zero-config MVP, WAL mode for concurrency |
-| Model | claude-opus-4-6 | Most capable for complex metadata extraction |
+| Model | claude-sonnet-4-6 | Matches Opus on agent evals (24/24) at ~5× lower cost, ~2s TTFT |
 | Streaming | SDK `include_partial_messages` + `StreamEvent` | Token-by-token deltas without buffering full messages |
 | Stop streaming | `AbortController` + `AbortSignal` on fetch | Cleanly closes SSE connection; partial response stays visible |
 | Metadata granularity | One record per type (shared vs asset) | Context-aware capture; no irrelevant follow-ups |
