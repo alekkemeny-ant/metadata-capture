@@ -48,6 +48,19 @@ async function collectEntryFiles(entry: FileSystemEntry, out: File[]): Promise<v
   }
 }
 
+/**
+ * Derive a session title from attached filenames when the user sends with
+ * no text. The first message `content` ends up in the sidebar and dashboard,
+ * so "(attached files)" is useless — "foo.csv extraction" is a real handle.
+ */
+function attachmentsLabel(filenames: string[]): string {
+  if (filenames.length === 0) return '(attached files)';
+  if (filenames.length === 1) return `${filenames[0]} extraction`;
+  const shown = filenames.slice(0, 2).join(', ');
+  const rest = filenames.length - 2;
+  return rest > 0 ? `${shown} +${rest} more — extraction` : `${shown} — extraction`;
+}
+
 // Upload a batch of files with at most `limit` in flight at once. Results
 // preserve input order so the caller can zip them back onto UI state.
 // Inline p-limit — not worth a dependency for ~15 lines.
@@ -371,11 +384,14 @@ function restoreMessages(sessionId: string, backendMessages: StructuredMessage[]
 
 interface ChatPanelProps {
   sessionId: string | null;
+  /** Increments when the user clicks "New Chat" — lets us abort a stream
+   * even when sessionId stays null. See useEffect below. */
+  newChatNonce?: number;
   onSessionChange: (sessionId: string) => void;
   agentOnline: boolean;
 }
 
-export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: ChatPanelProps) {
+export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, agentOnline }: ChatPanelProps) {
   const [messages, setMessages] = useState<StructuredMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
@@ -395,6 +411,12 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Monotonic token identifying which stream "owns" the UI. Bumped when the
+  // user switches sessions or clicks New Chat, so any in-flight SSE callback
+  // can detect it's stale and stop scribbling tokens into the wrong
+  // conversation. This is the claude.ai pattern — session ID alone isn't
+  // enough since a new chat has no ID until the first chunk arrives.
+  const activeStreamIdRef = useRef(0);
   const mountedRef = useRef(true);
   // Track whether the user has scrolled away from the bottom. While pinned,
   // every streaming token auto-scrolls; once the user scrolls up, we stop
@@ -445,8 +467,18 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
     });
   }, []);
 
-  // Load messages when sessionId changes, restoring blocks & partial messages
+  // Load messages when sessionId changes, restoring blocks & partial messages.
+  // Bumps the stream owner token + aborts any in-flight SSE fetch first —
+  // without this, switching chats (or clicking New Chat) mid-stream leaves
+  // the old fetch running, and its callbacks overwrite the freshly-loaded
+  // conversation with stale tokens. The token bump is defence-in-depth so
+  // even a chunk that races the abort gets dropped.
   useEffect(() => {
+    activeStreamIdRef.current += 1;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsStreaming(false);
+
     if (sessionId) {
       fetchMessages(sessionId)
         .then((msgs) => setMessages(restoreMessages(sessionId, msgs)))
@@ -454,7 +486,11 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
     } else {
       setMessages([]);
     }
-  }, [sessionId]);
+    // newChatNonce forces a re-run when "New Chat" is clicked while already
+    // in an unsaved new chat (sessionId null→null) — otherwise React's
+    // bail-out on equal state skips the abort.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, newChatNonce]);
 
   // Reset textarea height when input is cleared
   useEffect(() => {
@@ -667,9 +703,15 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
       }
     }
 
+    // Derive a descriptive label from filenames when there's no text — this
+    // content becomes the sidebar/session title, so "(attached files)" is
+    // useless. "foo.csv extraction" gives the chat a real name.
+    const fallbackLabel = attachmentsLabel(filesToUpload.map((f) => f.file.name));
+    const userText = trimmed || fallbackLabel;
+
     const userMsg: StructuredMessage = {
       role: 'user',
-      content: trimmed || '(attached files)',
+      content: userText,
       attachments: attachmentRefs,
     };
     // Re-pin on send so the new assistant response auto-scrolls even if
@@ -694,6 +736,13 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
     // the first SSE chunk, so for a new session this starts null.
     let sid = sessionId;
 
+    // Claim UI ownership. Any session switch / New Chat bumps the ref;
+    // callbacks check they still match before touching state. messagesRef
+    // keeps accumulating regardless so the full response ends up in
+    // localStorage under its original session.
+    const streamId = ++activeStreamIdRef.current;
+    const isStaleStream = () => activeStreamIdRef.current !== streamId;
+
     // Persist at most once per 250ms so we don't thrash localStorage at
     // SSE-token rate. Final save on done is unconditional.
     let lastPersist = 0;
@@ -706,7 +755,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
     };
 
     await sendChatMessage(
-      trimmed || '(attached files)',
+      userText,
       sessionId,
       (event) => {
         // Pick up session_id from sessionStorage once the first chunk sets it.
@@ -770,32 +819,37 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
         // check sees a change when we sync to state.
         messagesRef.current = [...msgs.slice(0, -1), { ...last, content, blocks }];
 
-        // Sync to state only if still mounted; persist regardless.
-        if (mountedRef.current) setMessages(messagesRef.current);
+        // Sync to state only if still mounted *and* the stream still owns
+        // the UI. Persist regardless — the response is saved under its
+        // original session so the user can come back to it.
+        if (mountedRef.current && !isStaleStream()) setMessages(messagesRef.current);
         maybePersist();
       },
       () => {
-        abortControllerRef.current = null;
+        // Only clear the shared ref if this stream still owns it — otherwise
+        // we'd null out the controller for a *newer* stream the user started
+        // in another session.
+        if (abortControllerRef.current === controller) abortControllerRef.current = null;
         sid ||= sessionStorage.getItem('chat_session_id');
         if (sid) {
           // Unconditional final persist — ref has the complete stream even if
           // the user navigated away mid-response.
           saveMessagesToStorage(sid, messagesRef.current);
         }
-        if (mountedRef.current) {
+        if (mountedRef.current && !isStaleStream()) {
           setIsStreaming(false);
           if (sid) onSessionChange(sid);
         }
       },
       (err) => {
-        abortControllerRef.current = null;
+        if (abortControllerRef.current === controller) abortControllerRef.current = null;
         // Strip the empty assistant slot on error
         const trimmed = messagesRef.current.at(-1)?.content === ''
           ? messagesRef.current.slice(0, -1)
           : messagesRef.current;
         messagesRef.current = trimmed;
         if (sid) saveMessagesToStorage(sid, trimmed);
-        if (mountedRef.current) {
+        if (mountedRef.current && !isStaleStream()) {
           setIsStreaming(false);
           setError(err.message);
           setMessages(trimmed);
@@ -893,7 +947,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
                   ) : (
                     <>
                       {msg.attachments && msg.attachments.length > 0 && (
-                        <div className="flex flex-wrap gap-2 mb-2">
+                        <div className="flex flex-wrap gap-1.5 mb-2 max-h-32 overflow-y-auto pr-1">
                           {msg.attachments.map((att, ai) => {
                             if (att.content_type.startsWith('image/')) {
                               return (
@@ -960,50 +1014,49 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
       {/* Input */}
       <div className="px-6 pb-6 pt-2">
         <div className="max-w-3xl mx-auto relative">
-          {/* Attachment preview strip — for large folder uploads show the
-              first 8 chips + a summary count so the strip doesn't push the
-              textarea off-screen. */}
+          {/* Attachment preview strip — two rows max, then scrolls. Every
+              file stays visible/removable; clear-all is a sticky header so
+              it doesn't scroll off with the chips. */}
           {pendingFiles.length > 0 && (
-            <div className="flex flex-wrap gap-2 mb-2 px-1 items-center">
-              {pendingFiles.length > 8 && (
-                <div className="text-xs text-sand-500 mr-1">
-                  {pendingFiles.length} files
-                  <button
-                    onClick={() => {
-                      pendingFiles.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
-                      setPendingFiles([]);
-                    }}
-                    className="ml-2 text-sand-400 hover:text-sand-600 underline"
-                  >
-                    clear all
-                  </button>
-                </div>
-              )}
-              {(pendingFiles.length > 8 ? pendingFiles.slice(0, 8) : pendingFiles).map((att, i) => (
-                <div key={i} className="relative group">
-                  {att.preview ? (
-                    <img src={att.preview} alt={att.file.name} className="w-16 h-16 rounded-lg object-cover border border-sand-200" />
-                  ) : (
-                    <div className="w-16 h-16 rounded-lg border border-sand-200 bg-sand-50 flex flex-col items-center justify-center">
-                      <span className="text-xl leading-none">{fileTypeIcon(att.file.type, att.file.name)}</span>
-                      <span className="text-[9px] text-sand-500 mt-0.5 truncate max-w-[56px] px-1">{att.file.name}</span>
-                    </div>
-                  )}
-                  <button
-                    onClick={() => removeFile(i)}
-                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-sand-600 text-white
-                               flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
-                  >
-                    &times;
-                  </button>
-                </div>
-              ))}
-              {pendingFiles.length > 8 && (
-                <div className="w-16 h-16 rounded-lg border border-dashed border-sand-300 bg-sand-50/50
-                                flex items-center justify-center text-xs text-sand-500">
-                  +{pendingFiles.length - 8}
-                </div>
-              )}
+            <div className="mb-2 rounded-xl border border-sand-200 bg-sand-50/40 overflow-hidden">
+              <div className="flex items-center justify-between px-3 py-1.5 border-b border-sand-200/60 bg-white/60">
+                <span className="text-xs text-sand-600 font-medium">
+                  {pendingFiles.length} {pendingFiles.length === 1 ? 'file' : 'files'}
+                </span>
+                <button
+                  onClick={() => {
+                    pendingFiles.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
+                    setPendingFiles([]);
+                  }}
+                  className="text-xs text-sand-400 hover:text-sand-600"
+                >
+                  Clear all
+                </button>
+              </div>
+              {/* max-h ≈ two chip rows; overflow-y-auto so a folder dump
+                  doesn't push the textarea off-screen. pr-1 gives the
+                  scrollbar room so the remove button isn't clipped. */}
+              <div className="flex flex-wrap gap-2 p-2 pr-1 max-h-44 overflow-y-auto chat-scroll">
+                {pendingFiles.map((att, i) => (
+                  <div key={i} className="relative group">
+                    {att.preview ? (
+                      <img src={att.preview} alt={att.file.name} className="w-16 h-16 rounded-lg object-cover border border-sand-200" />
+                    ) : (
+                      <div className="w-16 h-16 rounded-lg border border-sand-200 bg-white flex flex-col items-center justify-center">
+                        <span className="text-xl leading-none">{fileTypeIcon(att.file.type, att.file.name)}</span>
+                        <span className="text-[9px] text-sand-500 mt-0.5 truncate max-w-[56px] px-1" title={att.file.name}>{att.file.name}</span>
+                      </div>
+                    )}
+                    <button
+                      onClick={() => removeFile(i)}
+                      className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-sand-600 text-white
+                                 flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      &times;
+                    </button>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
           {/* Hidden file input */}

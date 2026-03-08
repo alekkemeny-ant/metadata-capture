@@ -273,7 +273,11 @@ function RecordEditor({
         <CategoryBadge category={record.category} />
         <span className="text-[10px] text-sand-400 ml-auto">{record.id.slice(0, 8)}</span>
       </div>
-      <div className="space-y-0.5">
+      {/* max-h + internal scroll: tall records (deeply nested procedures)
+          don't force the whole grid row to match their height, which left
+          big empty gaps next to short cards. ~24rem ≈ 18 field rows before
+          scrolling. The flex layout keeps + Add field pinned at the bottom. */}
+      <div className="space-y-0.5 max-h-96 overflow-y-auto pr-1 -mr-1">
         {allFields.map((field) =>
           field.isHeader ? (
             <div key={field.key} className="pt-2 pb-0.5 first:pt-0">
@@ -413,12 +417,8 @@ function SessionView({
           every column width whenever an expanded row renders its inner grid.
           Records gets the flex column since chips need room to wrap; Session
           title is already truncate max-w-xs so it doesn't need extra space. */}
-      <colgroup>
-        <col className="w-80" />     {/* Session — title truncates at max-w-xs anyway */}
-        <col />                      {/* Records chips — flex */}
-        <col className="w-44" />     {/* Created timestamp */}
-        <col className="w-24" />     {/* Actions */}
-      </colgroup>
+      {/* Session (title truncates at max-w-xs) / Records chips (flex) / Created / Actions */}
+      <colgroup><col className="w-80" /><col /><col className="w-44" /><col className="w-24" /></colgroup>
       <thead>
         <tr className="bg-sand-50 border-b border-sand-200">
           <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Session</th>
@@ -468,7 +468,12 @@ function SessionView({
               {isExpanded && (
                 <tr key={`${sid}-expanded`}>
                   <td colSpan={4} className="px-6 py-4 bg-sand-50 border-b border-sand-200">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {/* items-start overrides grid's default align-items:stretch
+                        so short cards don't get stretched to the row's tallest
+                        sibling. Tall cards are capped by RecordEditor's
+                        internal max-height+scroll so the grid doesn't stretch
+                        to fit a 40-field procedures dump. */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
                       {sessionRecords.map((r) => (
                         <div key={r.id} id={`record-${r.id}`} className="min-w-0">
                           <RecordEditor record={r} onSaved={onFieldSaved} />
@@ -546,7 +551,11 @@ function LibraryView({
           <span className="w-2 h-2 rounded-full bg-brand-violet-500" />
           Shared Records
         </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+        {/* Grid with items-start so short cards shrink-wrap their content
+            instead of stretching to the tallest sibling's height. Tall cards
+            are capped by RecordEditor's internal max-height+scroll so a
+            40-field procedures dump doesn't create giant grid-row gaps. */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 items-start">
           {SHARED_TYPES.flatMap((type) =>
             (byType[type] || []).map((r) => (
               <div key={r.id} id={`row-${r.id}`} className="min-w-0">
@@ -574,7 +583,7 @@ function LibraryView({
           <span className="w-2 h-2 rounded-full bg-sand-400" />
           Asset-Specific Records
         </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 items-start">
           {ASSET_TYPES.flatMap((type) =>
             (byType[type] || []).map((r) => (
               <div key={r.id} id={`row-${r.id}`} className="min-w-0">

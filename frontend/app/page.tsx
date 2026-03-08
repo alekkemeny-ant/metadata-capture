@@ -12,6 +12,10 @@ export default function Home() {
   const [sessionsSidebarOpen, setSessionsSidebarOpen] = useState(true);
   const [metadataSidebarOpen, setMetadataSidebarOpen] = useState(true);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // Bumped on "New Chat" so ChatPanel can abort a stream even when sessionId
+  // stays null (new-chat → new-chat). Without this React skips the re-render
+  // since state didn't change, and the old stream keeps writing.
+  const [newChatNonce, setNewChatNonce] = useState(0);
   const [agentOnline, setAgentOnline] = useState(false);
 
   const checkHealth = useCallback(async () => {
@@ -42,6 +46,7 @@ export default function Home() {
 
   const handleNewChat = () => {
     setSessionId(null);
+    setNewChatNonce((n) => n + 1);
     sessionStorage.removeItem('chat_session_id');
   };
 
@@ -89,6 +94,7 @@ export default function Home() {
         <div className="flex-1 flex flex-col bg-white min-w-0">
           <ChatPanel
             sessionId={sessionId}
+            newChatNonce={newChatNonce}
             onSessionChange={handleSelectSession}
             agentOnline={agentOnline}
           />
