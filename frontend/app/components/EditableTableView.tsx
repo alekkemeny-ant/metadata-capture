@@ -163,13 +163,13 @@ export const EditableCell = memo(function EditableCell({
     }
   }, [cancelEdit, commit, draft]);
 
-  // --- Read-only: upstream styling + muted text, but content always from `value` ---
+  // --- Read-only: cloned td + muted text, content always from `value` ---
   // (defaultTd is a styling vehicle only — display is always driven by `value` prop)
   if (mode === 'readonly') {
     return cloneElement(defaultTd, {
       onClick: onSelect,
-      className: (defaultTd.props.className ?? '') + ' text-gray-400',
-      children: display,
+      className: (defaultTd.props.className ?? '') + ' !text-sand-400',
+      children: <span className="truncate block">{display}</span>,
     });
   }
 
@@ -177,7 +177,9 @@ export const EditableCell = memo(function EditableCell({
   if (mode === 'enum' && isEditing && enumValues) {
     return cloneElement(defaultTd, {
       onClick: undefined,
-      className: (defaultTd.props.className ?? '') + ' !p-0 relative',
+      // ring-brand-orange signals "live editing" — warmer than the
+      // selection fig ring so the two states read differently at a glance.
+      className: (defaultTd.props.className ?? '') + ' !p-0 relative !ring-brand-orange-500',
       children: (
         <>
           <select
@@ -190,7 +192,7 @@ export const EditableCell = memo(function EditableCell({
             }}
             onBlur={() => !isSaving && cancelEdit()}
             onKeyDown={(e) => e.key === 'Escape' && cancelEdit()}
-            className="w-full h-full px-2 py-1 bg-white border-0 focus:outline-none text-sm disabled:opacity-50"
+            className="w-full h-full px-3 py-1.5 bg-white border-0 focus:outline-none text-sm text-sand-800 disabled:opacity-50 cursor-pointer"
           >
             {!enumValues.includes(display) && display && (
               <option value={display}>{display} (current)</option>
@@ -209,7 +211,7 @@ export const EditableCell = memo(function EditableCell({
   if (isEditing) {
     return cloneElement(defaultTd, {
       onClick: undefined,
-      className: (defaultTd.props.className ?? '') + ' !p-0 relative',
+      className: (defaultTd.props.className ?? '') + ' !p-0 relative !ring-brand-orange-500',
       children: (
         <>
           <input
@@ -222,7 +224,7 @@ export const EditableCell = memo(function EditableCell({
             }}
             onBlur={() => !isSaving && void commit(draft)}
             onKeyDown={handleEditKeyDown}
-            className="w-full h-full px-2 py-1 bg-white border-0 focus:outline-none text-sm disabled:opacity-50"
+            className="w-full h-full px-3 py-1.5 bg-white border-0 focus:outline-none text-sm text-sand-800 disabled:opacity-50"
           />
           {isSaving && <CellSpinner />}
           {error && <CellError message={error} />}
@@ -231,7 +233,9 @@ export const EditableCell = memo(function EditableCell({
     });
   }
 
-  // --- Display (not editing) — clone upstream <td> with edit-entry handlers ---
+  // --- Display (not editing) — clone td with edit-entry handlers ---
+  // Keep {display} as a direct text child so screen.getByText().focus()
+  // (and keyboard events generally) land on the td, not a wrapping span.
   return cloneElement(defaultTd, {
     onClick: handleClick,
     onKeyDown: handleDisplayKeyDown,
@@ -240,7 +244,13 @@ export const EditableCell = memo(function EditableCell({
       <>
         {display}
         {mode === 'enum' && isSelected && (
-          <span className="float-right text-gray-400 text-xs pointer-events-none">▾</span>
+          <svg
+            data-testid="enum-hint"
+            className="float-right w-3 h-3 mt-0.5 text-sand-400 pointer-events-none"
+            fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+          </svg>
         )}
       </>
     ),
@@ -249,13 +259,16 @@ export const EditableCell = memo(function EditableCell({
 
 function CellSpinner() {
   return (
-    <span className="absolute right-1.5 top-1/2 -translate-y-1/2 w-3 h-3 border-2 border-gray-200 border-t-blue-500 rounded-full animate-spin" />
+    <span className="absolute right-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5
+                     border-2 border-sand-200 border-t-brand-fig rounded-full animate-spin" />
   );
 }
 
 function CellError({ message }: { message: string }) {
   return (
-    <div className="absolute left-0 top-full mt-px z-20 px-2 py-1 bg-red-600 text-white text-xs rounded-b shadow-lg max-w-xs">
+    <div className="absolute left-0 top-full mt-px z-30 px-2.5 py-1.5
+                    bg-brand-orange-600 text-white text-xs rounded-b-lg shadow-lg max-w-xs
+                    animate-[slideDown_0.15s_ease-out]">
       {message}
     </div>
   );
