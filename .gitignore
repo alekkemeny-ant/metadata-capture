@@ -13,3 +13,6 @@ next-env.d.ts
 *.tsbuildinfo
 .vercel
 dist/
+agent/models/
+.claude/
+.playwright-mcp/
