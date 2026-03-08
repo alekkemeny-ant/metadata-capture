@@ -78,7 +78,12 @@ def client(setup_db):
 def test_health_returns_200_ok(client):
     resp = _run(client.get("/health"))
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    body = resp.json()
+    assert body["status"] == "ok"
+    # transcription field reports ffmpeg/whisper availability — value depends
+    # on the host, so only assert it's present and well-formed.
+    assert "transcription" in body
+    assert body["transcription"] == "available" or body["transcription"].startswith("unavailable:")
 
 
 # ---------------------------------------------------------------------------

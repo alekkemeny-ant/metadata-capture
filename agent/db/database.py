@@ -47,6 +47,10 @@ class Database(ABC):
     async def close(self) -> None:
         """Close the database connection / pool."""
 
+    @abstractmethod
+    async def init_tables(self) -> None:
+        """Create tables and indexes, run backend-specific migrations."""
+
 
 class PostgresDatabase(Database):
     """PostgreSQL backend using asyncpg."""
@@ -136,16 +140,30 @@ class SQLiteDatabase(Database):
             logger.info("SQLite connection closed")
 
     async def init_tables(self) -> None:
-        from .models import SQLITE_TABLES, CREATE_INDEXES
+        from .models import SQLITE_TABLES, CREATE_INDEXES, UPLOADS_EXTRACTION_COLUMNS
+        import aiosqlite
         conn = await self._get_conn()
         for ddl in SQLITE_TABLES:
             await conn.executescript(ddl)
         for idx in CREATE_INDEXES:
             await conn.execute(idx)
+        # Migrate: add attachments_json to conversations if missing
         cols_cursor = await conn.execute("PRAGMA table_info(conversations)")
         cols = {row[1] for row in await cols_cursor.fetchall()}
         if "attachments_json" not in cols:
             await conn.execute("ALTER TABLE conversations ADD COLUMN attachments_json TEXT")
+        # Migrate: add extraction columns to uploads if missing. Tolerate the
+        # duplicate-column race when multiple workers call init_db concurrently
+        # (check-then-alter is not atomic across processes with SQLite).
+        cursor = await conn.execute("PRAGMA table_info(uploads)")
+        upload_cols = {row[1] for row in await cursor.fetchall()}
+        for col_name, col_def in UPLOADS_EXTRACTION_COLUMNS:
+            if col_name not in upload_cols:
+                try:
+                    await conn.execute(f"ALTER TABLE uploads ADD COLUMN {col_name} {col_def}")
+                except aiosqlite.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
         await conn.commit()
 
 
