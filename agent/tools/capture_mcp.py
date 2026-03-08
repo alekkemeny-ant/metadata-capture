@@ -14,9 +14,10 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from ..shared import validation_events
+from ..shared import stream_events
 from .registry_lookup import lookup_addgene, lookup_mgi, lookup_ncbi_gene
 from .metadata_store import (
+    create_artifact,
     create_record,
     find_records as store_find_records,
     get_record,
@@ -296,9 +297,9 @@ async def capture_metadata_handler(args: dict[str, Any]) -> dict[str, Any]:
 
         # Push validation to the streaming queue so the frontend can
         # display errors/warnings inline in the tool dropdown.
-        queue = validation_events.get(None)
+        queue = stream_events.get(None)
         if queue is not None:
-            queue.put_nowait(validation_dict)
+            queue.put_nowait({"kind": "validation", "data": validation_dict})
 
         # Build a human-readable validation summary so the agent
         # reliably flags issues to the user in its response.
@@ -483,11 +484,108 @@ async def link_records_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# render_artifact tool
+# ---------------------------------------------------------------------------
+
+_VALID_ARTIFACT_TYPES = frozenset({"table", "json", "markdown", "code"})
+
+
+async def render_artifact_handler(args: dict[str, Any]) -> dict[str, Any]:
+    """Persist a structured artifact and notify the frontend via the stream queue."""
+    session_id = args.get("session_id")
+    if not session_id:
+        return _error("session_id is required")
+
+    artifact_type = args.get("artifact_type")
+    if artifact_type not in _VALID_ARTIFACT_TYPES:
+        return _error(f"artifact_type must be one of: {', '.join(sorted(_VALID_ARTIFACT_TYPES))}")
+
+    title = args.get("title")
+    if not title or not isinstance(title, str):
+        return _error("title is required")
+
+    content = args.get("content")
+    # Allow content as a JSON string too
+    if isinstance(content, str) and artifact_type in ("table", "json"):
+        try:
+            content = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if content is None:
+        return _error("content is required")
+
+    # Basic shape check for tables
+    if artifact_type == "table":
+        if not isinstance(content, dict) or "columns" not in content or "rows" not in content:
+            return _error('For artifact_type="table", content must be {"columns": [...], "rows": [[...], ...]}')
+
+    language = args.get("language")
+
+    try:
+        artifact = await create_artifact(session_id, artifact_type, title, content, language=language)
+    except Exception as e:
+        logger.exception("Failed to create artifact for session %s", session_id)
+        return _error(str(e))
+
+    # Push to stream queue so the frontend can render a chip inline
+    queue = stream_events.get(None)
+    if queue is not None:
+        queue.put_nowait({
+            "kind": "artifact",
+            "artifact": {
+                "id": artifact["id"],
+                "type": artifact_type,
+                "title": title,
+            },
+        })
+
+    return _success({
+        "artifact_id": artifact["id"],
+        "artifact_type": artifact_type,
+        "title": title,
+        "message": f"Artifact '{title}' rendered. The user can click the artifact chip in chat to view it.",
+    })
+
+
+@tool(
+    "render_artifact",
+    """Render structured content as a persistent artifact the user can click to view in-app.
+
+Use this when the user asks for a summary, comparison table, JSON dump, or formatted
+report of captured metadata — instead of (or in addition to) printing it in chat.
+
+Artifact types:
+- type="table": content must be {"columns": [str, ...], "rows": [[value, ...], ...]}
+- type="json": content is any JSON-serializable value (dict, list, etc.)
+- type="markdown": content is a markdown string
+- type="code": content is a code string; pass language="python" etc.
+
+Example:
+    render_artifact(
+        session_id="abc",
+        artifact_type="table",
+        title="Captured Subjects",
+        content={"columns": ["subject_id", "species", "sex"], "rows": [["4528", "Mus musculus", "Male"]]}
+    )
+""",
+    {
+        "session_id": str,
+        "artifact_type": str,
+        "title": str,
+        "content": dict,
+        "language": str,
+    },
+)
+async def render_artifact(args: dict[str, Any]) -> dict[str, Any]:
+    return await render_artifact_handler(args)
+
+
+# ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 
 capture_server = create_sdk_mcp_server(
     name="capture",
     version="2.0.0",
-    tools=[capture_metadata, find_records_tool, link_records_tool],
+    tools=[capture_metadata, find_records_tool, link_records_tool, render_artifact],
 )

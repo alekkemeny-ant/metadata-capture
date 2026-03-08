@@ -51,8 +51,37 @@ CREATE TABLE IF NOT EXISTS uploads (
     file_path TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     session_id TEXT,
+    extracted_text TEXT,
+    extracted_images_json TEXT,
+    extracted_meta_json TEXT,
+    extraction_status TEXT DEFAULT 'pending',
+    extraction_error TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+"""
+
+# Columns added to uploads after initial release — migrated in database.init_db()
+# via PRAGMA table_info check + ALTER TABLE.
+UPLOADS_EXTRACTION_COLUMNS: list[tuple[str, str]] = [
+    ("extracted_text", "TEXT"),
+    ("extracted_images_json", "TEXT"),
+    ("extracted_meta_json", "TEXT"),
+    ("extraction_status", "TEXT DEFAULT 'pending'"),
+    ("extraction_error", "TEXT"),
+]
+
+ARTIFACTS_TABLE = """
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    artifact_type TEXT NOT NULL
+        CHECK (artifact_type IN ('table', 'json', 'markdown', 'code')),
+    title TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    language TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
 """
 
 CREATE_INDEXES = """
@@ -69,7 +98,7 @@ CREATE_INDEXES_UPLOADS = """
 CREATE INDEX IF NOT EXISTS idx_uploads_session ON uploads(session_id);
 """
 
-ALL_TABLES = [METADATA_RECORDS_TABLE, RECORD_LINKS_TABLE, CONVERSATIONS_TABLE, UPLOADS_TABLE, CREATE_INDEXES, CREATE_INDEXES_UPLOADS]
+ALL_TABLES = [METADATA_RECORDS_TABLE, RECORD_LINKS_TABLE, CONVERSATIONS_TABLE, UPLOADS_TABLE, ARTIFACTS_TABLE, CREATE_INDEXES, CREATE_INDEXES_UPLOADS]
 
 # Category mapping: record_type -> category
 CATEGORY_MAP = {

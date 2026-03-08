@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, Fragment } from 'react';
+import { useState, useEffect, useCallback, useRef, Fragment } from 'react';
 import Link from 'next/link';
 import { fetchRecords, confirmRecord, updateRecordData, MetadataRecord, fetchSessions, Session } from '../lib/api';
 import AppSidebar from '../components/AppSidebar';
@@ -264,7 +264,10 @@ function RecordEditor({
   };
 
   return (
-    <div className="bg-white rounded-lg border border-sand-200 p-3">
+    <div className="bg-white rounded-lg border border-sand-200 p-3 min-w-0">
+      {/* min-w-0: when this editor sits inside a grid cell, default min-width
+          is max-content (longest field value) — which blows out column widths
+          in library view. Allowing shrink + truncating values keeps tiles even. */}
       <div className="flex items-center gap-2 mb-2">
         <div className={`w-2 h-2 rounded-full ${existingFields.length > 0 ? 'bg-brand-aqua-500' : 'bg-sand-300'}`} />
         <h5 className="text-sm font-medium text-sand-800">
@@ -273,7 +276,11 @@ function RecordEditor({
         <CategoryBadge category={record.category} />
         <span className="text-[10px] text-sand-400 ml-auto">{record.id.slice(0, 8)}</span>
       </div>
-      <div className="space-y-0.5">
+      {/* max-h + internal scroll: tall records (deeply nested procedures)
+          don't force the whole grid row to match their height, which left
+          big empty gaps next to short cards. ~24rem ≈ 18 field rows before
+          scrolling. The flex layout keeps + Add field pinned at the bottom. */}
+      <div className="space-y-0.5 max-h-96 overflow-y-auto pr-1 -mr-1">
         {allFields.map((field) =>
           field.isHeader ? (
             <div key={field.key} className="pt-2 pb-0.5 first:pt-0">
@@ -300,7 +307,8 @@ function RecordEditor({
               ) : field.value ? (
                 <>
                   <span
-                    className="text-sand-700 flex-1 cursor-pointer"
+                    className="text-sand-700 flex-1 min-w-0 truncate cursor-pointer"
+                    title={field.value}
                     onClick={() => { setEditingKey(field.key); setEditValue(field.value); }}
                   >
                     {field.value}
@@ -408,11 +416,15 @@ function SessionView({
 
   // Shared expanded-content renderer — used by both the desktop table row and
   // the mobile card stack so behavior stays identical across layouts.
+  // items-start overrides grid's default align-items:stretch so short cards
+  // don't get stretched to the row's tallest sibling. Tall cards are capped
+  // by RecordEditor's internal max-height+scroll so the grid doesn't stretch
+  // to fit a 40-field procedures dump.
   const renderExpandedContent = (sessionRecords: MetadataRecord[]) => (
     <>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
         {sessionRecords.map((r) => (
-          <div key={r.id} id={`record-${r.id}`}>
+          <div key={r.id} id={`record-${r.id}`} className="min-w-0">
             <RecordEditor record={r} onSaved={onFieldSaved} />
           </div>
         ))}
@@ -441,8 +453,16 @@ function SessionView({
 
   return (
     <>
-      {/* ─────────────────── Desktop: 4-column table ─────────────────── */}
-      <table className="hidden md:table w-full bg-white rounded-xl border border-sand-200 overflow-hidden">
+      {/* ─────────────────── Desktop: 4-column table ───────────────────
+          table-fixed + colgroup locks column widths so the expanded colSpan
+          row can't reflow sibling rows. Without this, table-layout:auto
+          recomputes every column width whenever an expanded row renders its
+          inner grid. Records gets the flex column since chips need room to
+          wrap; Session title is already truncate max-w-xs so it doesn't need
+          extra space. */}
+      <table className="hidden md:table w-full table-fixed bg-white rounded-xl border border-sand-200 overflow-hidden">
+        {/* Session / Records chips (flex) / Created / Actions */}
+        <colgroup><col className="w-80" /><col /><col className="w-44" /><col className="w-24" /></colgroup>
         <thead>
           <tr className="bg-sand-50 border-b border-sand-200">
             <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Session</th>
@@ -598,10 +618,14 @@ function LibraryView({
           <span className="w-2 h-2 rounded-full bg-brand-violet-500" />
           Shared Records
         </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+        {/* Grid with items-start so short cards shrink-wrap their content
+            instead of stretching to the tallest sibling's height. Tall cards
+            are capped by RecordEditor's internal max-height+scroll so a
+            40-field procedures dump doesn't create giant grid-row gaps. */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 items-start">
           {SHARED_TYPES.flatMap((type) =>
             (byType[type] || []).map((r) => (
-              <div key={r.id} id={`row-${r.id}`}>
+              <div key={r.id} id={`row-${r.id}`} className="min-w-0">
                 <RecordEditor record={r} onSaved={onFieldSaved} />
                 {r.status === 'draft' && (
                   <button
@@ -626,10 +650,10 @@ function LibraryView({
           <span className="w-2 h-2 rounded-full bg-sand-400" />
           Asset-Specific Records
         </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 items-start">
           {ASSET_TYPES.flatMap((type) =>
             (byType[type] || []).map((r) => (
-              <div key={r.id} id={`row-${r.id}`}>
+              <div key={r.id} id={`row-${r.id}`} className="min-w-0">
                 <RecordEditor record={r} onSaved={onFieldSaved} />
                 {r.status === 'draft' && (
                   <button
@@ -697,31 +721,36 @@ export default function DashboardPage() {
     return () => clearInterval(interval);
   }, [load]);
 
-  // Auto-expand and scroll to record when navigated via hash (e.g., /dashboard#record-id)
+  // Auto-expand and scroll to record when navigated via hash (e.g., /dashboard#record-id).
+  // One-shot: `records` is in deps because we need to wait for the first load,
+  // but the 10s poll replaces the array ref every tick — without a guard the
+  // scrollIntoView would re-fire forever and snap the user back.
+  const scrolledToHashRef = useRef(false);
   useEffect(() => {
-    if (loading || records.length === 0) return;
+    if (loading || records.length === 0 || scrolledToHashRef.current) return;
     const hash = window.location.hash.slice(1);
     if (!hash) return;
 
     // The hash is a record ID. Find the record to get its session_id.
     const targetRecord = records.find((r) => r.id === hash);
     if (targetRecord && view === 'session') {
-      // In session view, expand the session that contains this record
       setExpandedId(targetRecord.session_id);
     } else if (targetRecord && view === 'library') {
-      // In library view, records are always shown — just scroll
       setExpandedId(hash);
     } else {
-      // Fallback: try using hash directly (could be a session_id)
+      // Fallback: hash could be a session_id
       setExpandedId(hash);
     }
 
-    // Scroll to the record element after a brief delay for rendering
+    scrolledToHashRef.current = true;
+    // Clear the hash so view toggles / reloads don't re-trigger. replaceState
+    // avoids a history entry — back button still leaves the dashboard.
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+
     requestAnimationFrame(() => {
       setTimeout(() => {
         const el = document.getElementById(`row-${hash}`) || document.getElementById(`record-${hash}`);
         el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        // Add a brief highlight effect
         if (el) {
           el.classList.add('ring-2', 'ring-brand-fig/40', 'rounded-lg');
           setTimeout(() => el.classList.remove('ring-2', 'ring-brand-fig/40', 'rounded-lg'), 2000);
@@ -761,6 +790,16 @@ export default function DashboardPage() {
     draft: records.filter((r) => r.status === 'draft').length,
     confirmed: records.filter((r) => r.status === 'confirmed').length,
   };
+
+  // When a status/search filter is active, also filter the sessions list so
+  // the table doesn't show rows for sessions whose records were all filtered
+  // out. Without this the Draft pill can say "(0)" while the table still
+  // renders every session row with "No records" in each — confusing.
+  const filteredSessionIds = new Set(filtered.map((r) => r.session_id));
+  const visibleSessions =
+    filter === 'all' && !search
+      ? sessions
+      : sessions.filter((s) => filteredSessionIds.has(s.session_id));
 
   return (
     <div className="h-screen flex bg-white overflow-hidden">
@@ -842,7 +881,7 @@ export default function DashboardPage() {
           ) : view === 'session' ? (
             <SessionView
               records={filtered}
-              sessions={sessions}
+              sessions={visibleSessions}
               expandedId={expandedId}
               onToggle={(id) => setExpandedId(expandedId === id ? null : id)}
               onConfirm={handleConfirm}

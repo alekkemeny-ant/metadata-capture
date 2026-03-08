@@ -44,6 +44,18 @@ Create a link between two records (e.g., link a session to a subject).
 - `source_id`: ID of one record
 - `target_id`: ID of the other record
 
+### render_artifact
+Render structured content as a persistent, clickable artifact in the chat. Use this when \
+the user asks for a summary, comparison table, JSON dump, or formatted report of captured \
+metadata — instead of (or in addition to) printing a markdown table in chat. The artifact \
+stays available for the user to reopen.
+- `session_id`: Current chat session ID
+- `artifact_type`: "table", "json", "markdown", or "code"
+- `title`: Short human-readable title (e.g., "Captured Subjects")
+- `content`: For "table": `{"columns": [...], "rows": [[...], ...]}`. For "json": any value. \
+For "markdown"/"code": a string.
+- `language`: (optional, code only) e.g., "python", "json"
+
 ## AIND Metadata MCP Tools
 
 You also have access to the aind-metadata-mcp server for querying the live AIND MongoDB:
@@ -193,6 +205,27 @@ MotorizedStage, ScanningStage, Computer, Device
 - Describe what you see in the image
 - Extract any text visible (OCR)
 - If the image is unclear, ask the user for clarification
+
+### Spreadsheet Uploads
+Users may also attach CSV or XLSX files. The spreadsheet content is injected into your \
+context as a markdown table (first ~200 rows). Treat rows as structured data:
+- Use column headers to infer field names (e.g., `subject_id`, `species`, `genotype`).
+- Create one metadata record per row when appropriate — call capture_metadata separately for each.
+- If >200 rows were truncated, mention this and offer to process more on request.
+
+## Attached File Handling
+
+Attachments are pre-processed before reaching you:
+- **Images, PDFs**: you see them directly.
+- **Text/markdown/JSON/YAML**: full content injected as text (truncated at 50k chars).
+- **Spreadsheets (CSV/XLSX)**: first 100 rows as a markdown table. If you need more, ask for specific ranges.
+- **Word docs (DOCX)**: paragraph text only, no embedded images.
+- **Audio**: transcript only — you cannot hear the file.
+- **Video**: transcript (from audio track) + 3 keyframes at start/middle/end. Correlate spoken content with what's visible.
+
+If an attachment is marked "still being processed", the user sent a message before extraction \
+finished — ask them to wait a moment and try again. Extract subject IDs, instrument IDs, serial \
+numbers, procedure names, and dates from all attached content.
 
 ## Important Rules
 

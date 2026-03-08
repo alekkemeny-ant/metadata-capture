@@ -11,11 +11,11 @@
   expected_body:
     status: ok
 
-- id: metadata_list_empty
-  description: Metadata list returns empty array on fresh DB
+- id: records_list_empty
+  description: Records list returns empty array on fresh DB
   type: e2e
   method: GET
-  path: /metadata
+  path: /records
   expected_status: 200
   expected_body_type: list
 
@@ -27,17 +27,17 @@
   expected_status: 200
   expected_body_type: list
 
-- id: confirm_nonexistent_session
-  description: Confirming a nonexistent session returns 404
+- id: confirm_nonexistent_record
+  description: Confirming a nonexistent record returns 404
   type: e2e
   method: POST
-  path: /metadata/nonexistent-session-id/confirm
+  path: /records/nonexistent-record-id/confirm
   expected_status: 404
 
-- id: metadata_filter_by_status
-  description: Metadata list with status filter returns empty on fresh DB
+- id: records_filter_by_status
+  description: Records list with status filter returns empty on fresh DB
   type: e2e
   method: GET
-  path: /metadata?status=draft
+  path: /records?status=draft
   expected_status: 200
   expected_body_type: list

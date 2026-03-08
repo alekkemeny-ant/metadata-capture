@@ -1,10 +1,20 @@
 """FastAPI HTTP server wrapping the metadata capture agent service."""
 
+import asyncio
 import json
+import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+# The SDK runs `claude -v` in a fresh subprocess before every query() to
+# detect version mismatches. Profiled at ~50–300ms per call, but more
+# importantly it's one extra subprocess spawn + Python interpreter boot in
+# the hot path. We check at startup instead (version drift mid-process is
+# a non-concern for a single-worker service).
+os.environ.setdefault("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -13,13 +23,33 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .db.database import close_db, init_db
-from .service import AVAILABLE_MODELS, DEFAULT_MODEL, chat, get_session_messages, get_sessions
+from .sdk_client_pool import init_pool
+from .service import AVAILABLE_MODELS, DEFAULT_MODEL, _get_options, chat, get_session_messages, get_sessions
+from .tools.extractors import EXTRACTORS, EXT_EXTRACTORS, NATIVE_TYPES
+from .tools.spreadsheet import SPREADSHEET_CONTENT_TYPES, parse_spreadsheet
+
+logger = logging.getLogger(__name__)
 
 UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
-ALLOWED_CONTENT_TYPES = {
-    "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf",
-}
-MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
+
+# Extensions corresponding to NATIVE_TYPES — used as the extension fallback
+# for native files that arrive with a generic content-type like
+# application/octet-stream.
+_NATIVE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"})
+
+# Derive allowed types from the extractor registry so server.py never drifts
+# from extractors.py. NATIVE_TYPES are the formats Claude sees directly
+# (images, PDF); everything in EXTRACTORS/EXT_EXTRACTORS goes through the
+# upload-time background extraction pipeline. Native extensions are included
+# in the extension fallback so .png/.pdf etc. pass validation even when the
+# browser reports a generic MIME type.
+ALLOWED_CONTENT_TYPES = NATIVE_TYPES | set(EXTRACTORS.keys())
+ALLOWED_EXTENSIONS = set(EXT_EXTRACTORS.keys()) | _NATIVE_EXTS
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB — video needs headroom
+
+# Audio/video: fail fast at upload if ffmpeg/whisper are unavailable rather
+# than accepting the file and erroring 120s later at chat time.
+_AV_EXTS = frozenset({".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".mov", ".webm", ".mkv"})
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,10 +57,36 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialise the database on startup, close on shutdown."""
+    """Initialise DB + warm the SDK client pool on startup.
+
+    The pool pre-connects a ClaudeSDKClient during startup so the ~4s
+    subprocess spawn happens once, not per request. If the connect fails
+    (no API key, missing MCP deps, etc.), we log and continue — chat()
+    falls back to one-shot query() which has the same failure surface.
+    """
     await init_db()
+
+    if os.environ.get("USE_SDK_POOL", "1") == "1":
+        pool = init_pool(_get_options)
+        try:
+            await pool.warmup()
+        except Exception:
+            logger.exception(
+                "SDK client pool warmup failed — chat() will fall back to "
+                "per-request query() (~4s slower). Set USE_SDK_POOL=0 to silence."
+            )
+
     yield
     await close_db()
+    # Pool shutdown: disconnect() is best-effort — the subprocess dies
+    # with the worker anyway on SIGTERM.
+    from .sdk_client_pool import get_pool
+    p = get_pool()
+    if p is not None:
+        try:
+            await p.shutdown()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="AIND Metadata Capture Agent", lifespan=lifespan)
@@ -245,36 +301,137 @@ async def delete_session_endpoint(session_id: str):
 # Upload endpoints
 # ---------------------------------------------------------------------------
 
+# Folder uploads can enqueue dozens of files at once — each non-native file
+# spawns a background extraction task. Cap concurrency so a 100-file folder
+# of CSVs doesn't fire 100 simultaneous pandas parses and starve the event
+# loop / blow out memory. The single /upload endpoint stays unchanged; this
+# is purely backpressure on the background work.
+_EXTRACTION_SEMAPHORE = asyncio.Semaphore(3)
+
+
+async def _extract_and_store(upload_id: str, path: Path, content_type: str) -> None:
+    """Background: run extraction and persist to the uploads row.
+
+    Swallows all exceptions — a background failure must never crash the
+    server. On any error the upload row is marked status='error' so the
+    chat path can surface a readable message to the user.
+    """
+    from .tools.extractors import extract
+    from .tools.metadata_store import set_upload_extraction
+
+    async with _EXTRACTION_SEMAPHORE:
+        try:
+            result = await extract(path, content_type)
+            await set_upload_extraction(
+                upload_id,
+                text=result.text,
+                images=result.images,
+                meta=result.meta,
+                error=result.error,
+            )
+        except Exception as exc:
+            logger.exception("Background extraction failed for %s", upload_id)
+            try:
+                await set_upload_extraction(
+                    upload_id, text="", images=[], meta={}, error=str(exc),
+                )
+            except Exception:
+                # DB write itself failed — log and give up. The row stays
+                # 'pending'; the chat path will tell the user to wait, which
+                # is the least-bad outcome here.
+                logger.exception("Failed to persist extraction error for %s", upload_id)
+
 
 @app.post("/upload")
 async def upload_file(file: UploadFile, session_id: str | None = None):
-    """Upload a file (image or PDF) for use in chat messages."""
+    """Upload a file for use in chat messages.
+
+    Native types (images, PDF) are stored as-is. Everything else is handed to
+    the extraction pipeline as a background task so the single-worker uvicorn
+    process isn't blocked for the duration of a transcription.
+    """
     from .tools.metadata_store import save_upload
 
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
+    content_type = file.content_type or ""
+    ext = Path(file.filename or "").suffix.lower()
+
+    # MIME type takes precedence; extension is the fallback for browsers that
+    # report application/octet-stream or text/plain for known formats.
+    if content_type not in ALLOWED_CONTENT_TYPES and ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. Allowed: {', '.join(sorted(ALLOWED_CONTENT_TYPES))}",
+            detail=f"Unsupported file type: {content_type or '(none)'} / {ext or '(no ext)'}",
         )
+
+    # Audio/video: refuse the upload if ffmpeg/whisper aren't installed.
+    # Better a 503 now than a silent "still processing" forever.
+    if content_type.startswith(("audio/", "video/")) or ext in _AV_EXTS:
+        from .tools.transcribe import check_availability
+        avail = check_availability()
+        if not avail["available"]:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Transcription unavailable: missing {', '.join(avail['missing'])}",
+            )
 
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail="File too large. Maximum size is 20 MB.")
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024 * 1024)} MB.",
+        )
 
     file_id = str(uuid.uuid4())
-    ext = Path(file.filename or "file").suffix or ".bin"
-    dest = UPLOADS_DIR / f"{file_id}{ext}"
+    dest_ext = ext or ".bin"
+    dest = UPLOADS_DIR / f"{file_id}{dest_ext}"
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(contents)
 
-    return await save_upload(
+    # Native types (images, PDFs) go directly to Claude at chat time — no
+    # extraction pipeline. Mark them 'done' at insert so the frontend's
+    # polling loop sees them as ready immediately.
+    is_native = content_type in NATIVE_TYPES or ext in _NATIVE_EXTS
+
+    result = await save_upload(
         upload_id=file_id,
         original_filename=file.filename or "unknown",
-        content_type=file.content_type or "application/octet-stream",
+        content_type=content_type,
         file_path=str(dest),
         size_bytes=len(contents),
         session_id=session_id,
+        initial_status="done" if is_native else "pending",
     )
+
+    # Schedule extraction for non-native types. The task runs after this
+    # response is returned; the DB row starts as 'pending' and flips to
+    # 'done'/'error' when the task finishes.
+    if not is_native:
+        asyncio.create_task(_extract_and_store(file_id, dest, content_type))
+
+    return result
+
+
+@app.get("/uploads/{file_id}/extraction")
+async def get_upload_extraction_endpoint(file_id: str):
+    """Report extraction status and a preview of the extracted content.
+
+    Does not return image bytes — only counts — to keep the response small.
+    The frontend polls this to know when an upload is ready to reference
+    in chat.
+    """
+    from .tools.metadata_store import get_upload_extraction
+
+    result = await get_upload_extraction(file_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    return {
+        "status": result["status"],
+        "text_preview": (result["text"] or "")[:500],
+        "meta": result["meta"],
+        "error": result["error"],
+        "image_count": len(result["images"]),
+    }
 
 
 @app.get("/uploads/{file_id}")
@@ -297,6 +454,58 @@ async def get_uploaded_file(file_id: str):
     )
 
 
+@app.get("/uploads/{file_id}/table")
+async def get_upload_as_table(file_id: str) -> dict[str, Any]:
+    """Parse a spreadsheet upload (CSV/XLSX) into columns + rows."""
+    from .tools.metadata_store import get_upload
+
+    upload = await get_upload(file_id)
+    if upload is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    content_type = upload["content_type"]
+    if content_type not in SPREADSHEET_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Upload is not a spreadsheet")
+
+    file_path = Path(upload["file_path"])
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    try:
+        parsed = parse_spreadsheet(file_path, content_type)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to parse spreadsheet: {exc}")
+
+    return {
+        **parsed,
+        "filename": upload["original_filename"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Artifact endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/artifacts/{artifact_id}")
+async def get_artifact_endpoint(artifact_id: str) -> dict[str, Any]:
+    """Fetch a single artifact by ID."""
+    from .tools.metadata_store import get_artifact
+
+    artifact = await get_artifact(artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return artifact
+
+
+@app.get("/sessions/{session_id}/artifacts")
+async def list_session_artifacts(session_id: str) -> list[dict[str, Any]]:
+    """List all artifacts for a session."""
+    from .tools.metadata_store import list_artifacts
+
+    return await list_artifacts(session_id)
+
+
 # ---------------------------------------------------------------------------
 # Models + Health
 # ---------------------------------------------------------------------------
@@ -311,4 +520,11 @@ async def list_models():
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "ok"}
+    from .tools.transcribe import check_availability
+
+    avail = check_availability()
+    return {
+        "status": "ok",
+        "transcription": "available" if avail["available"]
+                         else f"unavailable: {', '.join(avail['missing'])}",
+    }

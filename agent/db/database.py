@@ -5,7 +5,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from .models import ALL_TABLES
+from .models import ALL_TABLES, UPLOADS_EXTRACTION_COLUMNS
 
 DB_DIR = Path(os.environ.get("METADATA_DB_DIR", Path(__file__).resolve().parent.parent))
 DB_PATH = DB_DIR / "metadata.db"
@@ -35,6 +35,18 @@ async def init_db() -> None:
     cols = {row[1] for row in await cursor.fetchall()}
     if "attachments_json" not in cols:
         await db.execute("ALTER TABLE conversations ADD COLUMN attachments_json TEXT")
+    # Migrate: add extraction columns to uploads if missing. Tolerate the
+    # duplicate-column race when multiple workers call init_db concurrently
+    # (check-then-alter is not atomic across processes with SQLite).
+    cursor = await db.execute("PRAGMA table_info(uploads)")
+    upload_cols = {row[1] for row in await cursor.fetchall()}
+    for col_name, col_def in UPLOADS_EXTRACTION_COLUMNS:
+        if col_name not in upload_cols:
+            try:
+                await db.execute(f"ALTER TABLE uploads ADD COLUMN {col_name} {col_def}")
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
     await db.commit()
 
 
