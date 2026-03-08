@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { sendChatMessage, fetchMessages, fetchModels, uploadFile, getUploadUrl, MessageAttachment } from '../lib/api';
+import { sendChatMessage, fetchMessages, uploadFile, getUploadUrl, MessageAttachment } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // File attachment types
@@ -266,15 +266,18 @@ interface ChatPanelProps {
   sessionId: string | null;
   onSessionChange: (sessionId: string) => void;
   agentOnline: boolean;
+  /** Model to send with chat requests — owned by page.tsx so the top-bar
+      ModelPicker can control it while ChatPanel remains the send-path. */
+  selectedModel: string;
+  /** Surfaces streaming state up to the page (to disable ModelPicker). */
+  onStreamingChange?: (streaming: boolean) => void;
 }
 
-export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: ChatPanelProps) {
+export default function ChatPanel({ sessionId, onSessionChange, agentOnline, selectedModel, onStreamingChange }: ChatPanelProps) {
   const [messages, setMessages] = useState<StructuredMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>('');
   const [pendingFiles, setPendingFiles] = useState<FileAttachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -292,13 +295,10 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
-  // Fetch available models on mount
+  // Bubble streaming state up so the top-bar ModelPicker can disable itself
   useEffect(() => {
-    fetchModels().then((info) => {
-      setAvailableModels(info.models);
-      setSelectedModel(info.default);
-    });
-  }, []);
+    onStreamingChange?.(isStreaming);
+  }, [isStreaming, onStreamingChange]);
 
   // Load messages when sessionId changes, restoring blocks & partial messages
   useEffect(() => {
@@ -594,7 +594,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
         </div>
       )}
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto chat-scroll px-6 py-6">
+      <div className="flex-1 overflow-y-auto chat-scroll px-4 sm:px-6 py-4 sm:py-6">
         <div className="max-w-3xl mx-auto space-y-6">
           {messages.length === 0 && (
             <div className="flex items-center justify-center h-full text-sand-400 text-sm pt-32">
@@ -698,7 +698,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
       </div>
 
       {/* Input */}
-      <div className="px-6 pb-6 pt-2">
+      <div className="px-3 sm:px-6 pb-3 sm:pb-6 pt-2 safe-bottom">
         <div className="max-w-3xl mx-auto relative">
           {/* Attachment preview strip */}
           {pendingFiles.length > 0 && (
@@ -718,7 +718,8 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
                   <button
                     onClick={() => removeFile(i)}
                     className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-sand-600 text-white
-                               flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+                               flex items-center justify-center text-xs transition-opacity
+                               opacity-100 md:opacity-0 md:group-hover:opacity-100"
                   >
                     &times;
                   </button>
@@ -751,7 +752,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
             placeholder="Describe your experiment..."
             rows={1}
             className="w-full resize-none rounded-2xl border border-sand-200 shadow-sm
-                       px-4 pt-3 pb-12 text-sm
+                       px-4 pt-3 pb-11 text-sm
                        focus:outline-none focus:ring-2 focus:ring-brand-fig/30 focus:border-brand-fig/50
                        disabled:bg-sand-50 disabled:text-sand-400
                        placeholder:text-sand-400"
@@ -762,28 +763,7 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
               <span className="text-sm text-sand-500 font-medium">Agent is starting up&hellip;</span>
             </div>
           )}
-          {/* Model selector */}
-          {availableModels.length > 0 && (
-            <div className="absolute left-3 bottom-3">
-              <select
-                value={selectedModel}
-                onChange={(e) => setSelectedModel(e.target.value)}
-                disabled={isStreaming || !agentOnline}
-                className="appearance-none text-xs text-sand-500 bg-transparent
-                           hover:text-sand-700 focus:text-sand-700 focus:outline-none
-                           cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed
-                           pr-4 py-1"
-                title="Select model"
-              >
-                {availableModels.map((m) => (
-                  <option key={m} value={m}>
-                    {m.replace('claude-', '').replace(/-\d{8}$/, '')}
-                  </option>
-                ))}
-              </select>
-              <svg className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 text-sand-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
-            </div>
-          )}
+          {/* Model selector moved to top bar — see ModelPicker + page.tsx */}
           <div className="absolute right-3 bottom-3 flex items-center gap-1.5">
             {/* Paperclip — attach files */}
             {!isStreaming && agentOnline && (

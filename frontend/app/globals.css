@@ -9,11 +9,19 @@
 }
 
 @layer components {
+  /* Chat bubbles — wider on mobile to use more of the narrow viewport,
+     narrower on desktop where there's room for breathing space. */
   .chat-bubble-user {
-    @apply bg-sand-100 text-sand-800 rounded-2xl rounded-br-sm px-4 py-2.5 max-w-[80%] ml-auto;
+    @apply bg-sand-100 text-sand-800 rounded-2xl rounded-br-sm px-4 py-2.5 max-w-[90%] sm:max-w-[80%] ml-auto;
   }
   .chat-bubble-agent {
-    @apply text-sand-800 max-w-[80%];
+    @apply text-sand-800 max-w-[95%] sm:max-w-[80%];
+  }
+
+  /* iOS safe-area — keeps the input above the home indicator on notched phones.
+     Fallback to 0 on desktop/Android where env() isn't defined. */
+  .safe-bottom {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
   }
 }
 
