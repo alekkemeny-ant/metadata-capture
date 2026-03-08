@@ -266,6 +266,13 @@ async def delete_session_endpoint(session_id: str):
 # Upload endpoints
 # ---------------------------------------------------------------------------
 
+# Folder uploads can enqueue dozens of files at once — each non-native file
+# spawns a background extraction task. Cap concurrency so a 100-file folder
+# of CSVs doesn't fire 100 simultaneous pandas parses and starve the event
+# loop / blow out memory. The single /upload endpoint stays unchanged; this
+# is purely backpressure on the background work.
+_EXTRACTION_SEMAPHORE = asyncio.Semaphore(3)
+
 
 async def _extract_and_store(upload_id: str, path: Path, content_type: str) -> None:
     """Background: run extraction and persist to the uploads row.
@@ -277,26 +284,27 @@ async def _extract_and_store(upload_id: str, path: Path, content_type: str) -> N
     from .tools.extractors import extract
     from .tools.metadata_store import set_upload_extraction
 
-    try:
-        result = await extract(path, content_type)
-        await set_upload_extraction(
-            upload_id,
-            text=result.text,
-            images=result.images,
-            meta=result.meta,
-            error=result.error,
-        )
-    except Exception as exc:
-        logger.exception("Background extraction failed for %s", upload_id)
+    async with _EXTRACTION_SEMAPHORE:
         try:
+            result = await extract(path, content_type)
             await set_upload_extraction(
-                upload_id, text="", images=[], meta={}, error=str(exc),
+                upload_id,
+                text=result.text,
+                images=result.images,
+                meta=result.meta,
+                error=result.error,
             )
-        except Exception:
-            # DB write itself failed — log and give up. The row stays
-            # 'pending'; the chat path will tell the user to wait, which
-            # is the least-bad outcome here.
-            logger.exception("Failed to persist extraction error for %s", upload_id)
+        except Exception as exc:
+            logger.exception("Background extraction failed for %s", upload_id)
+            try:
+                await set_upload_extraction(
+                    upload_id, text="", images=[], meta={}, error=str(exc),
+                )
+            except Exception:
+                # DB write itself failed — log and give up. The row stays
+                # 'pending'; the chat path will tell the user to wait, which
+                # is the least-bad outcome here.
+                logger.exception("Failed to persist extraction error for %s", upload_id)
 
 
 @app.post("/upload")

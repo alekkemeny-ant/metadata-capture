@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, Fragment } from 'react';
+import { useState, useEffect, useCallback, useRef, Fragment } from 'react';
 import Link from 'next/link';
 import { fetchRecords, confirmRecord, updateRecordData, MetadataRecord, fetchSessions, Session } from '../lib/api';
 import Header from '../components/Header';
@@ -403,7 +403,16 @@ function SessionView({
   }
 
   return (
-    <table className="w-full bg-white rounded-xl border border-sand-200 overflow-hidden">
+    <table className="w-full table-fixed bg-white rounded-xl border border-sand-200 overflow-hidden">
+      {/* table-fixed + colgroup locks column widths so the expanded colSpan row
+          can't reflow sibling rows. Without this, table-layout:auto recomputes
+          every column width whenever an expanded row renders its inner grid. */}
+      <colgroup>
+        <col />                      {/* Session — flex */}
+        <col className="w-48" />     {/* Records chips */}
+        <col className="w-40" />     {/* Created timestamp */}
+        <col className="w-24" />     {/* Actions */}
+      </colgroup>
       <thead>
         <tr className="bg-sand-50 border-b border-sand-200">
           <th className="text-left px-6 py-3 text-xs font-semibold text-sand-500 uppercase tracking-wider">Session</th>
@@ -615,31 +624,36 @@ export default function DashboardPage() {
     return () => clearInterval(interval);
   }, [load]);
 
-  // Auto-expand and scroll to record when navigated via hash (e.g., /dashboard#record-id)
+  // Auto-expand and scroll to record when navigated via hash (e.g., /dashboard#record-id).
+  // One-shot: `records` is in deps because we need to wait for the first load,
+  // but the 10s poll replaces the array ref every tick — without a guard the
+  // scrollIntoView would re-fire forever and snap the user back.
+  const scrolledToHashRef = useRef(false);
   useEffect(() => {
-    if (loading || records.length === 0) return;
+    if (loading || records.length === 0 || scrolledToHashRef.current) return;
     const hash = window.location.hash.slice(1);
     if (!hash) return;
 
     // The hash is a record ID. Find the record to get its session_id.
     const targetRecord = records.find((r) => r.id === hash);
     if (targetRecord && view === 'session') {
-      // In session view, expand the session that contains this record
       setExpandedId(targetRecord.session_id);
     } else if (targetRecord && view === 'library') {
-      // In library view, records are always shown — just scroll
       setExpandedId(hash);
     } else {
-      // Fallback: try using hash directly (could be a session_id)
+      // Fallback: hash could be a session_id
       setExpandedId(hash);
     }
 
-    // Scroll to the record element after a brief delay for rendering
+    scrolledToHashRef.current = true;
+    // Clear the hash so view toggles / reloads don't re-trigger. replaceState
+    // avoids a history entry — back button still leaves the dashboard.
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+
     requestAnimationFrame(() => {
       setTimeout(() => {
         const el = document.getElementById(`row-${hash}`) || document.getElementById(`record-${hash}`);
         el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        // Add a brief highlight effect
         if (el) {
           el.classList.add('ring-2', 'ring-brand-fig/40', 'rounded-lg');
           setTimeout(() => el.classList.remove('ring-2', 'ring-brand-fig/40', 'rounded-lg'), 2000);

@@ -26,6 +26,26 @@ function isSpreadsheet(typeOrName: string): boolean {
   return SPREADSHEET_TYPES.has(typeOrName) || typeOrName.toLowerCase().endsWith('.csv') || typeOrName.toLowerCase().endsWith('.xlsx');
 }
 
+// Upload a batch of files with at most `limit` in flight at once. Results
+// preserve input order so the caller can zip them back onto UI state.
+// Inline p-limit — not worth a dependency for ~15 lines.
+async function throttledUpload(
+  files: File[],
+  sessionId: string | undefined,
+  limit: number,
+): Promise<Awaited<ReturnType<typeof uploadFile>>[]> {
+  const results = new Array(files.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, files.length) }, async () => {
+    while (cursor < files.length) {
+      const idx = cursor++;
+      results[idx] = await uploadFile(files[idx], sessionId);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 // Compact icon for non-image attachment chips (preview strip + sent messages)
 function fileTypeIcon(contentType: string, filename: string): string {
   const ext = filename.toLowerCase().split('.').pop() || '';
@@ -349,9 +369,15 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(true);
+  // Track whether the user has scrolled away from the bottom. While pinned,
+  // every streaming token auto-scrolls; once the user scrolls up, we stop
+  // fighting them until they scroll back down or send a new message.
+  const isPinnedToBottomRef = useRef(true);
 
   // Track mount state so async polls don't update state after unmount
   useEffect(() => {
@@ -363,8 +389,19 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, []);
 
+  const handleMessagesScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    // 50px threshold — close enough to bottom counts as pinned, so small
+    // sub-pixel layout shifts during rendering don't accidentally unpin.
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+    isPinnedToBottomRef.current = atBottom;
+  }, []);
+
+  // Only follow the stream if the user hasn't scrolled away. Using a ref
+  // (not state) for the pin flag avoids re-renders on every scroll event.
   useEffect(() => {
-    scrollToBottom();
+    if (isPinnedToBottomRef.current) scrollToBottom();
   }, [messages, scrollToBottom]);
 
   // Fetch available models on mount
@@ -405,10 +442,15 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
   // File attachment helpers
   // ---------------------------------------------------------------------------
 
-  // Server validates MIME/extension; client only enforces the size cap.
+  // Server validates MIME/extension; client only enforces the size cap and
+  // drops OS junk files that come along with directory picks.
+  const JUNK_FILES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
   const addFiles = (files: FileList | File[]) => {
     const newAttachments: FileAttachment[] = [];
     for (const file of Array.from(files)) {
+      // Skip OS metadata and hidden dotfiles — webkitdirectory recursively
+      // collects everything, including .DS_Store in every subdir.
+      if (JUNK_FILES.has(file.name) || file.name.startsWith('.')) continue;
       if (file.size > 100 * 1024 * 1024) continue;  // 100 MB — matches server MAX_UPLOAD_SIZE
       const preview = file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined;
       newAttachments.push({ file, preview });
@@ -546,13 +588,17 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
 
     setError(null);
 
-    // Upload pending files first
+    // Upload pending files first. Throttled to 4 concurrent POSTs so a
+    // folder upload with dozens of files doesn't saturate the connection
+    // or overwhelm the single-worker backend.
     let attachmentRefs: MessageAttachment[] | undefined;
     const filesToUpload = [...pendingFiles];
     if (filesToUpload.length > 0) {
       try {
-        const uploaded = await Promise.all(
-          filesToUpload.map((f) => uploadFile(f.file, sessionId || undefined))
+        const uploaded = await throttledUpload(
+          filesToUpload.map((f) => f.file),
+          sessionId || undefined,
+          4,
         );
         attachmentRefs = uploaded.map((u) => ({
           file_id: u.id,
@@ -576,6 +622,9 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
       content: trimmed || '(attached files)',
       attachments: attachmentRefs,
     };
+    // Re-pin on send so the new assistant response auto-scrolls even if
+    // the user had scrolled up earlier in the conversation.
+    isPinnedToBottomRef.current = true;
     setMessages((prev) => [...prev, userMsg]);
     setInput('');
     // Clean up previews and clear pending files
@@ -706,7 +755,11 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
         </div>
       )}
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto chat-scroll px-6 py-6">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleMessagesScroll}
+        className="flex-1 overflow-y-auto chat-scroll px-6 py-6"
+      >
         <div className="max-w-3xl mx-auto space-y-6">
           {messages.length === 0 && (
             <div className="flex items-center justify-center h-full text-sand-400 text-sm pt-32">
@@ -834,10 +887,26 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
       {/* Input */}
       <div className="px-6 pb-6 pt-2">
         <div className="max-w-3xl mx-auto relative">
-          {/* Attachment preview strip */}
+          {/* Attachment preview strip — for large folder uploads show the
+              first 8 chips + a summary count so the strip doesn't push the
+              textarea off-screen. */}
           {pendingFiles.length > 0 && (
-            <div className="flex flex-wrap gap-2 mb-2 px-1">
-              {pendingFiles.map((att, i) => (
+            <div className="flex flex-wrap gap-2 mb-2 px-1 items-center">
+              {pendingFiles.length > 8 && (
+                <div className="text-xs text-sand-500 mr-1">
+                  {pendingFiles.length} files
+                  <button
+                    onClick={() => {
+                      pendingFiles.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
+                      setPendingFiles([]);
+                    }}
+                    className="ml-2 text-sand-400 hover:text-sand-600 underline"
+                  >
+                    clear all
+                  </button>
+                </div>
+              )}
+              {(pendingFiles.length > 8 ? pendingFiles.slice(0, 8) : pendingFiles).map((att, i) => (
                 <div key={i} className="relative group">
                   {att.preview ? (
                     <img src={att.preview} alt={att.file.name} className="w-16 h-16 rounded-lg object-cover border border-sand-200" />
@@ -856,6 +925,12 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
                   </button>
                 </div>
               ))}
+              {pendingFiles.length > 8 && (
+                <div className="w-16 h-16 rounded-lg border border-dashed border-sand-300 bg-sand-50/50
+                                flex items-center justify-center text-xs text-sand-500">
+                  +{pendingFiles.length - 8}
+                </div>
+              )}
             </div>
           )}
           {/* Hidden file input */}
@@ -864,6 +939,21 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
             type="file"
             multiple
             accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,audio/mpeg,audio/wav,audio/mp4,audio/ogg,video/mp4,video/quicktime,video/webm,.txt,.md,.json,.yaml,.yml,.csv,.xlsx,.xls,.docx,.mp3,.wav,.m4a,.ogg,.mp4,.mov,.webm"
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files?.length) addFiles(e.target.files);
+              e.target.value = '';
+            }}
+          />
+          {/* Hidden folder input — webkitdirectory can't coexist with plain
+              `multiple` file selection on a single element, so it needs its
+              own input. React types don't know webkitdirectory/directory so
+              we spread them as data attributes to appease TS. */}
+          <input
+            ref={folderInputRef}
+            type="file"
+            multiple
+            {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
             className="hidden"
             onChange={(e) => {
               if (e.target.files?.length) addFiles(e.target.files);
@@ -917,6 +1007,20 @@ export default function ChatPanel({ sessionId, onSessionChange, agentOnline }: C
             </div>
           )}
           <div className="absolute right-3 bottom-3 flex items-center gap-1.5">
+            {/* Folder — upload entire directory */}
+            {!isStreaming && agentOnline && (
+              <button
+                onClick={() => folderInputRef.current?.click()}
+                className="w-9 h-9 rounded-xl border border-sand-200
+                           flex items-center justify-center text-sand-400
+                           hover:text-sand-600 hover:bg-sand-50 transition-colors"
+                title="Attach a folder — all files inside will be uploaded"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 12.75V12A2.25 2.25 0 014.5 9.75h15A2.25 2.25 0 0121.75 12v.75m-8.69-6.44l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z" />
+                </svg>
+              </button>
+            )}
             {/* Paperclip — attach files */}
             {!isStreaming && agentOnline && (
               <button

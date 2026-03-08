@@ -333,3 +333,96 @@ def test_extraction_db_round_trip_error_status(tmp_path, monkeypatch):
         assert got["error"] == "ffmpeg not found"
     finally:
         _run(close_db())
+
+
+# ---------------------------------------------------------------------------
+# Options caching (TTFT fix) — _get_options should build once per model
+# ---------------------------------------------------------------------------
+
+
+def test_get_options_caches_per_model():
+    """_get_options builds once per model key and returns the same object."""
+    from agent.service import _get_options, _OPTIONS_CACHE, DEFAULT_MODEL
+
+    _OPTIONS_CACHE.clear()  # isolate from other tests / prior runs
+    try:
+        a = _get_options(None)
+        b = _get_options(None)
+        assert a is b, "repeated calls with same model must return cached instance"
+        assert DEFAULT_MODEL in _OPTIONS_CACHE
+
+        # Unknown model falls back to DEFAULT_MODEL — same cache slot
+        c = _get_options("claude-nonexistent-99")
+        assert c is a, "unknown models fall back to default cache entry"
+    finally:
+        _OPTIONS_CACHE.clear()
+
+
+def test_get_options_separate_entries_per_known_model():
+    from agent.service import _get_options, _OPTIONS_CACHE, AVAILABLE_MODELS
+
+    _OPTIONS_CACHE.clear()
+    try:
+        # Two distinct known models → two distinct cached instances
+        m0, m1 = AVAILABLE_MODELS[0], AVAILABLE_MODELS[1]
+        o0 = _get_options(m0)
+        o1 = _get_options(m1)
+        assert o0 is not o1
+        assert len(_OPTIONS_CACHE) == 2
+    finally:
+        _OPTIONS_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Extraction semaphore (folder upload backpressure)
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_semaphore_limits_concurrency():
+    """_extract_and_store must honor the module-level semaphore cap.
+
+    We patch the extractor with a slow coroutine and schedule 6 tasks at
+    once. At most 3 should be inside extract() at any moment.
+    """
+    from agent import server as srv
+
+    max_concurrent = 0
+    current = 0
+    gate = asyncio.Event()
+
+    async def fake_extract(path, content_type):
+        nonlocal current, max_concurrent
+        current += 1
+        max_concurrent = max(max_concurrent, current)
+        # Hold until the test releases us — guarantees all tasks are
+        # queued before any completes, so the semaphore is the only
+        # thing limiting observed concurrency.
+        await gate.wait()
+        current -= 1
+        # Minimal shape for set_upload_extraction kwargs access
+        class R:  # noqa: N801
+            text = ""
+            images: list = []
+            meta: dict = {}
+            error = None
+        return R()
+
+    # Throw away DB writes and use our fake extractor
+    with patch("agent.tools.extractors.extract", new=fake_extract), \
+         patch("agent.tools.metadata_store.set_upload_extraction", new=AsyncMock()):
+
+        async def drive():
+            tasks = [
+                asyncio.create_task(srv._extract_and_store(f"id{i}", Path("/tmp/x"), "text/csv"))
+                for i in range(6)
+            ]
+            # Let the first batch enter the semaphore
+            await asyncio.sleep(0.01)
+            assert max_concurrent <= 3, f"semaphore leaked: saw {max_concurrent} concurrent extractions"
+            # Release everything and drain
+            gate.set()
+            await asyncio.gather(*tasks)
+
+        _run(drive())
+
+    assert max_concurrent == 3, f"expected exactly 3 concurrent (limit), got {max_concurrent}"

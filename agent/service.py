@@ -22,6 +22,7 @@ from .tools.capture_mcp import capture_server
 from .tools.metadata_store import (
     get_conversation_history,
     get_session_records,
+    get_upload,
     get_upload_extraction,
     save_conversation_turn,
 )
@@ -102,6 +103,20 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     )
 
     return opts
+
+
+# Options are immutable once built — cache per-model to avoid re-running
+# shutil.which() + file stat on the MCP config for every chat request. The
+# MCP subprocess spawn itself still happens inside query() (SDK limitation),
+# but this shaves the setup overhead and positions us for future session reuse.
+_OPTIONS_CACHE: dict[str, ClaudeAgentOptions] = {}
+
+
+def _get_options(model: str | None) -> ClaudeAgentOptions:
+    key = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
+    if key not in _OPTIONS_CACHE:
+        _OPTIONS_CACHE[key] = _build_options(model=key)
+    return _OPTIONS_CACHE[key]
 
 
 def _format_conversation_context(history: list[dict[str, Any]], user_message: str) -> str:
@@ -285,38 +300,49 @@ async def chat(
         ]
     await save_conversation_turn(session_id, "user", user_message, attachments=attachment_meta)
 
-    # Send session_id first
+    # Send session_id first so the frontend can set up its UI state while
+    # we're still gathering context below.
     yield {"session_id": session_id}
 
+    # History + records + attachment lookups are independent reads — run them
+    # concurrently. TTFT is dominated by the MCP subprocess spawn inside
+    # query(), but this shaves the serialized round-trips that came before it.
+    # The attachment lookups are themselves a gather, so we end up with one
+    # await that fans out to 2 + N coroutines.
+    async def _resolve_uploads() -> list[dict[str, Any] | None]:
+        if not attachments:
+            return []
+        return await asyncio.gather(*(get_upload(a["file_id"]) for a in attachments))
+
+    history, records, uploads = await asyncio.gather(
+        get_conversation_history(session_id),
+        get_session_records(session_id),
+        _resolve_uploads(),
+    )
+
     # Build conversation context
-    history = await get_conversation_history(session_id)
     prior_history = history[:-1] if history else []
     prompt = _format_conversation_context(prior_history, user_message)
-
-    # Add context about existing records for this session
-    records = await get_session_records(session_id)
     if records:
         prompt += _format_records_context(records)
 
     # Add session_id context for the capture tools
     prompt += f"\n\nIMPORTANT: When calling capture_metadata, always use session_id=\"{session_id}\""
 
-    # Build multimodal content if attachments are present
-    if attachments:
-        # Resolve file paths from upload records. Carry file_id through so
-        # _build_multimodal_content can look up cached extraction results
-        # for non-native types.
-        resolved_attachments = []
-        for att in attachments:
-            from .tools.metadata_store import get_upload
-            upload = await get_upload(att["file_id"])
-            if upload:
-                resolved_attachments.append({
-                    "file_id": att["file_id"],
-                    "file_path": upload["file_path"],
-                    "content_type": att["content_type"],
-                    "filename": att["filename"],
-                })
+    # Build multimodal content if attachments are present. Upload rows were
+    # already fetched concurrently above; zip them back onto the attachment
+    # descriptors and skip any that didn't resolve.
+    if attachments and uploads:
+        resolved_attachments = [
+            {
+                "file_id": att["file_id"],
+                "file_path": up["file_path"],
+                "content_type": att["content_type"],
+                "filename": att["filename"],
+            }
+            for att, up in zip(attachments, uploads)
+            if up is not None
+        ]
         if resolved_attachments:
             prompt_content = await _build_multimodal_content(prompt, resolved_attachments)
         else:
@@ -325,7 +351,7 @@ async def chat(
         prompt_content = prompt
 
     # Run the agent with streaming input (required for custom MCP tools)
-    options = _build_options(model=model)
+    options = _get_options(model)
     full_response: list[str] = []
 
     # Track how much text was streamed via deltas so we can detect
