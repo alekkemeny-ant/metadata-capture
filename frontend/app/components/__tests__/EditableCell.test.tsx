@@ -199,9 +199,9 @@ describe('EditableCell — enum mode', () => {
     isSelected: true,
   };
 
-  it('shows the ▾ hint when selected in display mode', () => {
+  it('shows the enum dropdown hint when selected in display mode', () => {
     render(wrap(<EditableCell {...enumProps} />));
-    expect(screen.getByText('▾')).toBeInTheDocument();
+    expect(screen.getByTestId('enum-hint')).toBeInTheDocument();
   });
 
   it('second click opens a <select> with all enum values', async () => {
