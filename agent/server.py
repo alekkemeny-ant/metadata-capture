@@ -64,7 +64,10 @@ async def lifespan(app: FastAPI):
     (no API key, missing MCP deps, etc.), we log and continue — chat()
     falls back to one-shot query() which has the same failure surface.
     """
-    await init_db()
+    try:
+        await init_db()
+    except Exception:
+        logger.exception("Database initialization failed — continuing without DB")
 
     if os.environ.get("USE_SDK_POOL", "1") == "1":
         pool = init_pool(_get_options)

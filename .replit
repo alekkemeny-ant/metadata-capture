@@ -40,5 +40,5 @@ externalPort = 80
 
 [deployment]
 deploymentTarget = "autoscale"
-run = ["bash", "-c", "export REPLIT_DEPLOYMENT=1 && cd /home/runner/workspace && python -m agent.run & sleep 3 && cd /home/runner/workspace/frontend && npm run start"]
-build = ["bash", "-c", "pip install -r agent/requirements.txt && pip install ./aind-metadata-mcp && npm install -g @anthropic-ai/claude-code && cd frontend && npm install && npm run build"]
+run = ["bash", "-c", "cd /home/runner/workspace && python -m agent.run 2>&1 & sleep 5 && cd /home/runner/workspace/frontend && npm run start"]
+build = ["bash", "-c", "cd /home/runner/workspace && pip install -r agent/requirements.txt && pip install ./aind-metadata-mcp && npm install -g @anthropic-ai/claude-code && cd frontend && npm install && npm run build"]
