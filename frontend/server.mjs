@@ -30,7 +30,7 @@ app.prepare().then(() => {
 
           backendWs.on('message', (data) => {
             if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(data);
+              clientWs.send(data.toString());
             }
           });
         });
