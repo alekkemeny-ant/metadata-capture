@@ -1,6 +1,6 @@
 import { createServer } from 'http';
 import next from 'next';
-import { request as httpRequest } from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
@@ -10,59 +10,61 @@ const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
 app.prepare().then(() => {
-  createServer((req, res) => {
-    if (req.method === 'POST' && req.url === '/api/chat') {
-      let body = '';
-      req.on('data', (chunk) => { body += chunk; });
-      req.on('end', () => {
-        const proxyReq = httpRequest(
-          {
-            hostname: 'localhost',
-            port: 8001,
-            path: '/chat',
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Content-Length': Buffer.byteLength(body),
-            },
-          },
-          (proxyRes) => {
-            res.writeHead(200, {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache, no-store, no-transform',
-              'X-Accel-Buffering': 'no',
-              'X-Content-Type-Options': 'nosniff',
-              Connection: 'keep-alive',
-            });
+  const server = createServer((req, res) => {
+    handle(req, res);
+  });
 
-            proxyRes.on('data', (chunk) => {
-              res.write(chunk);
-            });
+  const wss = new WebSocketServer({ noServer: true });
 
-            proxyRes.on('end', () => {
-              res.end();
-            });
+  server.on('upgrade', (req, socket, head) => {
+    if (req.url === '/ws/chat') {
+      wss.handleUpgrade(req, socket, head, (clientWs) => {
+        const backendWs = new WebSocket('ws://localhost:8001/ws/chat');
 
-            proxyRes.on('error', () => {
-              res.end();
-            });
-          },
-        );
+        backendWs.on('open', () => {
+          clientWs.on('message', (data) => {
+            if (backendWs.readyState === WebSocket.OPEN) {
+              backendWs.send(data);
+            }
+          });
 
-        proxyReq.on('error', () => {
-          if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Backend unreachable' }));
+          backendWs.on('message', (data) => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(data);
+            }
+          });
+        });
+
+        backendWs.on('close', () => {
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.close();
           }
         });
 
-        proxyReq.write(body);
-        proxyReq.end();
+        backendWs.on('error', () => {
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.close();
+          }
+        });
+
+        clientWs.on('close', () => {
+          if (backendWs.readyState === WebSocket.OPEN) {
+            backendWs.close();
+          }
+        });
+
+        clientWs.on('error', () => {
+          if (backendWs.readyState === WebSocket.OPEN) {
+            backendWs.close();
+          }
+        });
       });
     } else {
-      handle(req, res);
+      socket.destroy();
     }
-  }).listen(port, hostname, () => {
+  });
+
+  server.listen(port, hostname, () => {
     console.log(`> Custom server ready on http://${hostname}:${port}`);
   });
 });

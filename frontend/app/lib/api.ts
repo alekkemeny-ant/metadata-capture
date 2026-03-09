@@ -145,73 +145,77 @@ export async function sendChatMessage(
   attachments?: MessageAttachment[],
 ) {
   try {
-    const res = await fetch(`${API_BASE}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${window.location.host}/ws/chat`;
+    const ws = new WebSocket(wsUrl);
+    let msgCount = 0;
+    const t0 = Date.now();
+
+    const cleanup = () => {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        cleanup();
+        onDone();
+      });
+    }
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
         message,
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(model ? { model } : {}),
         ...(attachments?.length ? { attachments } : {}),
-      }),
-      signal,
-    });
+      }));
+    };
 
-    if (!res.ok) {
-      throw new Error(`Chat request failed: ${res.status}`);
-    }
+    ws.onmessage = (event) => {
+      msgCount++;
+      try {
+        const parsed = JSON.parse(event.data);
+        console.log(`[WS] msg #${msgCount} +${Date.now() - t0}ms`, Object.keys(parsed).join(','));
 
-    const reader = res.body?.getReader();
-    if (!reader) throw new Error('No response body');
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let chunkCount = 0;
-    const t0 = Date.now();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      chunkCount++;
-      const raw = decoder.decode(value, { stream: true });
-      console.log(`[SSE] chunk #${chunkCount} +${Date.now() - t0}ms len=${raw.length}`);
-
-      buffer += raw;
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
-          if (data === '[DONE]') {
-            console.log(`[SSE] DONE after ${chunkCount} chunks, ${Date.now() - t0}ms`);
-            onDone();
-            return;
-          }
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.session_id) {
-              sessionStorage.setItem('chat_session_id', parsed.session_id);
-            }
-            if (parsed.content || parsed.thinking_start || parsed.thinking ||
-                parsed.tool_use_start || parsed.tool_use_input || parsed.block_stop ||
-                parsed.tool_result || parsed.artifact) {
-              onChunk(parsed);
-            }
-          } catch {
-            onChunk({ content: data });
-          }
+        if (parsed.session_id) {
+          sessionStorage.setItem('chat_session_id', parsed.session_id);
         }
+
+        if (parsed.done) {
+          console.log(`[WS] DONE after ${msgCount} msgs, ${Date.now() - t0}ms`);
+          cleanup();
+          onDone();
+          return;
+        }
+
+        if (parsed.error) {
+          cleanup();
+          onError(new Error(parsed.error));
+          return;
+        }
+
+        if (parsed.content || parsed.thinking_start || parsed.thinking ||
+            parsed.tool_use_start || parsed.tool_use_input || parsed.block_stop ||
+            parsed.tool_result || parsed.artifact) {
+          onChunk(parsed);
+        }
+      } catch {
+        onChunk({ content: event.data });
       }
-    }
-    console.log(`[SSE] stream ended (no DONE) after ${chunkCount} chunks, ${Date.now() - t0}ms`);
-    onDone();
+    };
+
+    ws.onerror = () => {
+      onError(new Error('WebSocket connection failed'));
+    };
+
+    ws.onclose = (event) => {
+      if (!event.wasClean && msgCount === 0) {
+        onError(new Error('WebSocket closed unexpectedly'));
+      }
+    };
   } catch (err) {
-    if (err instanceof Error && err.name === 'AbortError') {
-      onDone(); // Treat abort as a graceful stop, not an error
-      return;
-    }
     onError(err as Error);
   }
 }
