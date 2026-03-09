@@ -107,17 +107,22 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     # fastmcp installed. Defaults to the system conda py311 env that was
     # already hosting the editable install.
     mcp_src = MCP_SERVER_DIR / "src"
+    print(f"[MCP] MCP_SERVER_DIR={MCP_SERVER_DIR}, src exists={mcp_src.is_dir()}, SKIP={os.environ.get('SKIP_AIND_MCP')}", flush=True)
     if mcp_src.is_dir() and os.environ.get("SKIP_AIND_MCP") != "1":
         mcp_python = os.environ.get(
             "AIND_MCP_PYTHON",
             sys.executable,
         )
+        existing_pypath = os.environ.get("PYTHONPATH", "")
+        new_pypath = f"{mcp_src}:{existing_pypath}" if existing_pypath else str(mcp_src)
+        mcp_env = {**os.environ, "PYTHONPATH": new_pypath}
+        print(f"[MCP] Registering AIND MCP server via {mcp_python} (src={mcp_src})", flush=True)
         logger.info("Registering AIND MCP server via %s (src=%s)", mcp_python, mcp_src)
         mcp_servers["aind-metadata-mcp"] = {
             "type": "stdio",
             "command": mcp_python,
             "args": ["-m", "aind_metadata_mcp.data_access_server"],
-            "env": {"PYTHONPATH": str(mcp_src)},
+            "env": mcp_env,
         }
 
     # Built-in tools (Bash/Read/Glob/Grep/WebFetch/WebSearch) dropped — the

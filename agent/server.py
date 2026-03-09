@@ -64,15 +64,19 @@ async def lifespan(app: FastAPI):
     (no API key, missing MCP deps, etc.), we log and continue — chat()
     falls back to one-shot query() which has the same failure surface.
     """
+    print("[lifespan] Initializing database...", flush=True)
     try:
         await init_db()
+        print("[lifespan] Database initialized OK", flush=True)
     except Exception:
         logger.exception("Database initialization failed — continuing without DB")
 
     if os.environ.get("USE_SDK_POOL", "1") == "1":
         pool = init_pool(_get_options)
+        print("[lifespan] Warming SDK client pool...", flush=True)
         try:
             await pool.warmup()
+            print("[lifespan] SDK client pool warm", flush=True)
         except Exception:
             logger.exception(
                 "SDK client pool warmup failed — chat() will fall back to "
