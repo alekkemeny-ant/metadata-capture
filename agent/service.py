@@ -550,7 +550,7 @@ async def chat(
     full_response: list[str] = []
 
     pool = get_pool()
-    use_pool = pool is not None and pool.is_warm and os.environ.get("USE_SDK_POOL", "1") == "1"
+    use_pool = pool is not None and pool.is_warm and os.environ.get("USE_SDK_POOL", "0") == "1"
     path = "pool" if use_pool else "query()"
     logger.info("Chat path=%s for session %s", path, session_id)
 

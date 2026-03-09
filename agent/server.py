@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Database initialization failed — continuing without DB")
 
-    if os.environ.get("USE_SDK_POOL", "1") == "1":
+    if os.environ.get("USE_SDK_POOL", "0") == "1":
         pool = init_pool(_get_options)
         print("[lifespan] Warming SDK client pool...", flush=True)
         try:

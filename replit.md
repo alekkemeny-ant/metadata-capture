@@ -66,8 +66,9 @@ workspace/
   - Re-added count_records and aggregation_retrieval to allowed MCP tools (16 tools total)
   - Updated system prompt to explicitly list aggregation tools and clarify AIND MCP vs local capture tools
   - Added /debug rewrite to Next.js config
-  - Disabled SDK client pool in production (USE_SDK_POOL=0): the pool's long-lived CLI subprocess loses MCP stdio connections during idle time between requests; per-request query() spawns fresh CLI+MCP processes (~4s slower but MCP tools stay alive)
+  - Disabled SDK client pool everywhere (USE_SDK_POOL defaults to 0): the pool's long-lived CLI subprocess loses MCP stdio connections during idle time and causes 100s+ query latency; per-request query() spawns fresh CLI+MCP processes (~4s overhead but MCP tools stay alive and queries complete in normal time)
   - Added chat path logging (pool vs query) for production diagnostics
+  - Pool can be re-enabled with USE_SDK_POOL=1 env var if the underlying SDK/MCP idle issue is resolved
 - 2026-02-27: Added offline chat protection
   - Health check state lifted to page.tsx, passed as prop to Header and ChatPanel
   - Chat input disabled with "Agent is starting up..." overlay when agent offline
