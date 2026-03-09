@@ -66,9 +66,9 @@ workspace/
   - Re-added count_records and aggregation_retrieval to allowed MCP tools (16 tools total)
   - Updated system prompt to explicitly list aggregation tools and clarify AIND MCP vs local capture tools
   - Added /debug rewrite to Next.js config
-  - Disabled SDK client pool everywhere (USE_SDK_POOL defaults to 0): the pool's long-lived CLI subprocess loses MCP stdio connections during idle time and causes 100s+ query latency; per-request query() spawns fresh CLI+MCP processes (~4s overhead but MCP tools stay alive and queries complete in normal time)
+  - SDK client pool enabled (USE_SDK_POOL=1) in both dev and prod; pool pre-warms a CLI subprocess at startup (~2.5s) so chat requests skip the ~4s spawn overhead
   - Added chat path logging (pool vs query) for production diagnostics
-  - Pool can be re-enabled with USE_SDK_POOL=1 env var if the underlying SDK/MCP idle issue is resolved
+  - Pool can be disabled with USE_SDK_POOL=0 env var if MCP idle disconnects recur
   - Fixed real-time streaming on Replit: Replit's reverse proxy buffers all HTTP responses (including SSE with X-Accel-Buffering: no), so switched chat to WebSocket transport which delivers frames immediately
   - Added WebSocket endpoint `/ws/chat` to FastAPI backend (agent/server.py) — accepts JSON message, streams events as individual WS frames
   - Created custom Node.js server (frontend/server.mjs) that proxies `/ws/chat` WebSocket upgrades to backend and passes all other requests to Next.js
