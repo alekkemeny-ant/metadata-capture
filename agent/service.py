@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -109,7 +110,7 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     if mcp_src.is_dir() and os.environ.get("SKIP_AIND_MCP") != "1":
         mcp_python = os.environ.get(
             "AIND_MCP_PYTHON",
-            "/opt/homebrew/Caskroom/miniforge/base/envs/py311/bin/python3",
+            sys.executable,
         )
         logger.info("Registering AIND MCP server via %s (src=%s)", mcp_python, mcp_src)
         mcp_servers["aind-metadata-mcp"] = {
