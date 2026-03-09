@@ -166,12 +166,18 @@ export async function sendChatMessage(
 
     const decoder = new TextDecoder();
     let buffer = '';
+    let chunkCount = 0;
+    const t0 = Date.now();
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
+      chunkCount++;
+      const raw = decoder.decode(value, { stream: true });
+      console.log(`[SSE] chunk #${chunkCount} +${Date.now() - t0}ms len=${raw.length}`);
+
+      buffer += raw;
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
@@ -179,6 +185,7 @@ export async function sendChatMessage(
         if (line.startsWith('data: ')) {
           const data = line.slice(6);
           if (data === '[DONE]') {
+            console.log(`[SSE] DONE after ${chunkCount} chunks, ${Date.now() - t0}ms`);
             onDone();
             return;
           }
@@ -187,19 +194,18 @@ export async function sendChatMessage(
             if (parsed.session_id) {
               sessionStorage.setItem('chat_session_id', parsed.session_id);
             }
-            // Forward any content-bearing event to the chunk handler
             if (parsed.content || parsed.thinking_start || parsed.thinking ||
                 parsed.tool_use_start || parsed.tool_use_input || parsed.block_stop ||
                 parsed.tool_result || parsed.artifact) {
               onChunk(parsed);
             }
           } catch {
-            // Plain text chunk — wrap as a content event
             onChunk({ content: data });
           }
         }
       }
     }
+    console.log(`[SSE] stream ended (no DONE) after ${chunkCount} chunks, ${Date.now() - t0}ms`);
     onDone();
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
