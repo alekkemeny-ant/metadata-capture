@@ -1018,11 +1018,6 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
       () => {
         if (abortControllerRef.current === controller) abortControllerRef.current = null;
         sid ||= sessionStorage.getItem('chat_session_id');
-        const lastMsg = entry.messages[entry.messages.length - 1];
-        const blockCount = lastMsg?.blocks?.length ?? 0;
-        const textBlocks = lastMsg?.blocks?.filter(b => b.type === 'text').length ?? 0;
-        const contentLen = lastMsg?.content?.length ?? 0;
-        console.log(`[chat] onDone: ${entry.messages.length} msgs, last role=${lastMsg?.role}, blocks=${blockCount} (text=${textBlocks}), content=${contentLen} chars`);
         if (sid) saveMessagesToStorage(sid, entry.messages);
         notify(true);
         streamRegistry.delete(registryKey);
