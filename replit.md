@@ -58,6 +58,31 @@ workspace/
   - `agent/db/models.py`: separate `PG_TABLES` and `SQLITE_TABLES` DDL lists, shared `CREATE_INDEXES`
   - Tables: metadata_records, record_links, conversations, uploads
   - Added /artifacts rewrite to Next.js config
+- 2026-03-09: Production MCP debugging & fixes
+  - MCP subprocess env now inherits full parent env (was only PYTHONPATH, stripping PATH/credentials)
+  - Added PYTHONUNBUFFERED=1 to deployment run command for unbuffered log output
+  - Added print-based startup diagnostics (lifespan steps, MCP dir check, registration)
+  - Re-added count_records and aggregation_retrieval to allowed MCP tools (16 tools total)
+  - Updated system prompt to explicitly list aggregation tools and clarify AIND MCP vs local capture tools
+  - SDK client pool enabled (USE_SDK_POOL=1) in both dev and prod; pool pre-warms a CLI subprocess at startup (~2.5s) so chat requests skip the ~4s spawn overhead
+  - Added chat path logging (pool vs query) for production diagnostics
+  - Pool can be disabled with USE_SDK_POOL=0 env var if MCP idle disconnects recur
+  - Fixed real-time streaming on Replit: Replit's reverse proxy buffers all HTTP responses (including SSE with X-Accel-Buffering: no), so switched chat to WebSocket transport which delivers frames immediately
+  - Added WebSocket endpoint `/ws/chat` to FastAPI backend (agent/server.py) — accepts JSON message, streams events as individual WS frames
+  - Created custom Node.js server (frontend/server.mjs) that proxies `/ws/chat` WebSocket upgrades to backend and passes all other requests to Next.js
+  - Frontend `sendChatMessage` in api.ts auto-detects Replit (hostname includes `.replit.dev`, `.repl.co`, or `.replit.app`) and uses WebSocket; otherwise falls back to SSE via `/chat` rewrite
+  - SSE `/chat` endpoint still exists on backend and via Next.js rewrite for non-Replit environments
+  - `npm run dev` / `npm run start` use standard Next.js (SSE); `npm run dev:replit` / `npm run start:replit` use custom server (WebSocket)
+  - Workflow and deployment commands use `dev:replit` / `start:replit` scripts
+  - Fixed NEXT_PUBLIC_API_URL default from 'http://localhost:8001' to '' (empty = use same-origin rewrites), preventing mixed-content HTTPS→HTTP failures in Replit iframe
+- 2026-03-10: Fixed "final message missing" bug for multi-turn tool-using queries
+  - Root cause: `max_turns=5` was too low for complex tool-using queries (e.g. VR foraging needed 11 turns); SDK hit the limit and returned empty ResultMessage with no text. Increased to `max_turns=15`
+  - Secondary fix: `_translate_to_sse()` now extracts text from `ResultMessage.result` when `full_response` is empty, and appends unstreamed trailing text. Handles `is_error=True` ResultMessages by surfacing error details to the user
+  - Hardened reconciliation: only appends suffix when `result.startswith(streamed_text)`
+  - Added comprehensive ResultMessage logging: `is_error`, `subtype`, `result_len`
+  - Reduced watchfiles reload noise: added `reload_excludes` for frontend/, .local/, node_modules/, etc. in `agent/run.py`
+  - Fixed Next.js `allowedDevOrigins` from `['*']` to explicit Replit host patterns
+  - Cleaned up diagnostic logging: removed noisy per-AssistantMessage warnings, removed PII from result logging
 - 2026-02-27: Added offline chat protection
   - Health check state lifted to page.tsx, passed as prop to Header and ChatPanel
   - Chat input disabled with "Agent is starting up..." overlay when agent offline
