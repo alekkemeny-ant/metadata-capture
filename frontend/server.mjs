@@ -31,6 +31,11 @@ app.prepare().then(() => {
         clientWs.on('message', async (data) => {
           const payload = data.toString();
           abortController = new AbortController();
+          let eventCount = 0;
+          let lastEventType = '';
+          let wsState = 'open';
+
+          console.log('[bridge] SSE fetch starting');
 
           try {
             const res = await fetch('http://localhost:8001/chat', {
@@ -41,6 +46,7 @@ app.prepare().then(() => {
             });
 
             if (!res.ok) {
+              console.log(`[bridge] Backend returned ${res.status}`);
               if (clientWs.readyState === 1) {
                 clientWs.send(JSON.stringify({ error: `Backend error: ${res.status}` }));
                 clientWs.close();
@@ -48,6 +54,8 @@ app.prepare().then(() => {
               clearInterval(pingInterval);
               return;
             }
+
+            console.log('[bridge] SSE stream connected');
 
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
@@ -57,12 +65,32 @@ app.prepare().then(() => {
               if (line.startsWith('data: ')) {
                 const eventData = line.slice(6);
                 if (eventData === '[DONE]') {
+                  eventCount++;
+                  lastEventType = '[DONE]';
                   if (clientWs.readyState === 1) {
                     clientWs.send(JSON.stringify({ done: true }));
+                  } else {
+                    wsState = 'closed-before-done';
+                    console.log(`[bridge] WS already closed (state=${clientWs.readyState}) when sending [DONE]`);
                   }
                 } else if (eventData.trim()) {
+                  eventCount++;
+                  try {
+                    const parsed = JSON.parse(eventData);
+                    if (parsed.done) lastEventType = 'done';
+                    else if (parsed.content) lastEventType = 'content';
+                    else if (parsed.session_id) lastEventType = 'session_id';
+                    else if (parsed.tool_use_start) lastEventType = 'tool_use_start';
+                    else if (parsed.tool_result) lastEventType = 'tool_result';
+                    else if (parsed.error) lastEventType = 'error';
+                    else lastEventType = Object.keys(parsed)[0] || 'unknown';
+                  } catch { lastEventType = 'unparsed'; }
+
                   if (clientWs.readyState === 1) {
                     clientWs.send(eventData);
+                  } else {
+                    wsState = 'closed-before-send';
+                    console.log(`[bridge] WS closed (state=${clientWs.readyState}) dropping event #${eventCount} type=${lastEventType}`);
                   }
                 }
               }
@@ -84,12 +112,16 @@ app.prepare().then(() => {
             if (buffer.trim()) {
               processLine(buffer);
             }
+
+            console.log(`[bridge] SSE stream ended: ${eventCount} events, lastType=${lastEventType}, wsState=${wsState}`);
           } catch (err) {
             if (err.name !== 'AbortError') {
-              console.error('SSE-to-WS bridge error:', err.message);
+              console.error(`[bridge] Error: ${err.message}`);
               if (clientWs.readyState === 1) {
                 clientWs.send(JSON.stringify({ error: err.message }));
               }
+            } else {
+              console.log(`[bridge] Fetch aborted (client disconnected), ${eventCount} events sent, lastType=${lastEventType}`);
             }
           } finally {
             clearInterval(pingInterval);
@@ -100,11 +132,13 @@ app.prepare().then(() => {
         });
 
         clientWs.on('close', () => {
+          console.log('[bridge] Client WS closed');
           clearInterval(pingInterval);
           if (abortController) abortController.abort();
         });
 
-        clientWs.on('error', () => {
+        clientWs.on('error', (err) => {
+          console.error('[bridge] Client WS error:', err.message);
           clearInterval(pingInterval);
           if (abortController) abortController.abort();
         });

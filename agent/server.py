@@ -158,13 +158,18 @@ async def chat_endpoint(req: ChatRequest):
 
     async def event_stream():
         queue: asyncio.Queue[str | None] = asyncio.Queue()
+        evt_count = 0
 
         async def _produce():
+            nonlocal evt_count
             try:
                 async for chunk in chat(session_id, req.message, model=req.model, attachments=attachments):
+                    evt_count += 1
                     await queue.put(f"data: {json.dumps(chunk)}\n\n")
+                logger.info("SSE producer: chat() finished, %d events yielded, sending [DONE]", evt_count)
                 await queue.put("data: [DONE]\n\n")
             except Exception as exc:
+                logger.exception("SSE producer error after %d events: %s", evt_count, exc)
                 await queue.put(f"data: {json.dumps({'error': str(exc)})}\n\n")
             finally:
                 await queue.put(None)
@@ -180,12 +185,16 @@ async def chat_endpoint(req: ChatRequest):
                 if item is None:
                     break
                 yield item
+        except GeneratorExit:
+            logger.warning("SSE consumer: GeneratorExit after %d events (client disconnected mid-stream)", evt_count)
+            raise
         finally:
             producer.cancel()
             try:
                 await producer
             except (asyncio.CancelledError, Exception):
                 pass
+            logger.info("SSE consumer: stream ended, %d events total", evt_count)
 
     return StreamingResponse(
         event_stream(),
