@@ -75,8 +75,14 @@ async def lifespan(app: FastAPI):
         pool = init_pool(_get_options)
         print("[lifespan] Warming SDK client pool...", flush=True)
         try:
-            await pool.warmup()
+            await asyncio.wait_for(pool.warmup(), timeout=30)
             print("[lifespan] SDK client pool warm", flush=True)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "SDK client pool warmup timed out after 30s — chat() will fall back to "
+                "per-request query() (~4s slower)."
+            )
+            print("[lifespan] SDK client pool warmup timed out", flush=True)
         except Exception:
             logger.exception(
                 "SDK client pool warmup failed — chat() will fall back to "
@@ -205,6 +211,7 @@ async def chat_ws(ws: WebSocket):
 
         async for chunk in chat(session_id, message, model=model, attachments=attachments):
             await ws.send_text(json.dumps(chunk))
+        await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         pass
     except Exception as exc:

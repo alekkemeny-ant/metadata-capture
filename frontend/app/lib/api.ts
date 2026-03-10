@@ -162,6 +162,7 @@ function sendViaWebSocket(
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/chat`);
   let msgCount = 0;
+  let gotDone = false;
 
   const cleanup = () => {
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
@@ -170,7 +171,7 @@ function sendViaWebSocket(
   };
 
   if (signal) {
-    signal.addEventListener('abort', () => { cleanup(); cb.onDone(); });
+    signal.addEventListener('abort', () => { cleanup(); cb.onDone(); gotDone = true; });
   }
 
   ws.onopen = () => { ws.send(JSON.stringify(payload)); };
@@ -179,17 +180,18 @@ function sendViaWebSocket(
     msgCount++;
     try {
       const result = handleEvent(JSON.parse(event.data), cb);
-      if (result !== 'continue') cleanup();
+      if (result === 'done') { gotDone = true; cleanup(); }
+      else if (result === 'error') { gotDone = true; cleanup(); }
     } catch {
       cb.onChunk({ content: event.data });
     }
   };
 
-  ws.onerror = () => { cb.onError(new Error('WebSocket connection failed')); };
-  ws.onclose = (event) => {
-    if (!event.wasClean && msgCount === 0) {
-      cb.onError(new Error('WebSocket closed unexpectedly'));
-    }
+  ws.onerror = () => {
+    if (!gotDone) { gotDone = true; cb.onError(new Error('WebSocket connection failed')); }
+  };
+  ws.onclose = () => {
+    if (!gotDone) { gotDone = true; cb.onDone(); }
   };
 }
 
