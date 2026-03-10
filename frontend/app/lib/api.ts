@@ -141,6 +141,7 @@ type ChatCallbacks = {
 };
 
 function handleEvent(parsed: Record<string, unknown>, cb: ChatCallbacks): 'done' | 'error' | 'continue' {
+  if (parsed.ping) return 'continue';
   if (parsed.session_id) {
     sessionStorage.setItem('chat_session_id', parsed.session_id as string);
   }

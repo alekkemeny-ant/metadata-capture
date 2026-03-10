@@ -21,6 +21,33 @@ app.prepare().then(() => {
     if (pathname === '/ws/chat') {
       wss.handleUpgrade(req, socket, head, (clientWs) => {
         const backendWs = new WebSocket('ws://localhost:8001/ws/chat');
+        let pendingSends = 0;
+
+        const pingInterval = setInterval(() => {
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.ping();
+          }
+        }, 20000);
+
+        const closeClient = () => {
+          const doClose = () => {
+            clearInterval(pingInterval);
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.close();
+            }
+          };
+          if (pendingSends > 0) {
+            const check = setInterval(() => {
+              if (pendingSends <= 0) {
+                clearInterval(check);
+                setTimeout(doClose, 50);
+              }
+            }, 10);
+            setTimeout(() => { clearInterval(check); doClose(); }, 2000);
+          } else {
+            setTimeout(doClose, 50);
+          }
+        };
 
         backendWs.on('open', () => {
           clientWs.on('message', (data) => {
@@ -31,32 +58,39 @@ app.prepare().then(() => {
 
           backendWs.on('message', (data) => {
             if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(data.toString());
+              pendingSends++;
+              clientWs.send(data.toString(), (err) => {
+                pendingSends--;
+                if (err) {
+                  console.error('Failed to forward WS message to client:', err.message);
+                }
+              });
             }
           });
         });
 
         backendWs.on('close', () => {
-          if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.close();
-          }
+          closeClient();
         });
 
         backendWs.on('error', () => {
+          clearInterval(pingInterval);
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.close();
           }
         });
 
         clientWs.on('close', () => {
-          if (backendWs.readyState === WebSocket.OPEN) {
-            backendWs.close();
+          clearInterval(pingInterval);
+          if (backendWs.readyState === WebSocket.OPEN || backendWs.readyState === WebSocket.CONNECTING) {
+            backendWs.terminate();
           }
         });
 
         clientWs.on('error', () => {
-          if (backendWs.readyState === WebSocket.OPEN) {
-            backendWs.close();
+          clearInterval(pingInterval);
+          if (backendWs.readyState === WebSocket.OPEN || backendWs.readyState === WebSocket.CONNECTING) {
+            backendWs.terminate();
           }
         });
       });
