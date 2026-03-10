@@ -579,8 +579,16 @@ async def chat(
 
     # Save the assistant's complete response
     assistant_text = "".join(full_response)
+    logger.info("chat() post-stream: full_response has %d parts, %d chars total, session=%s",
+                len(full_response), len(assistant_text), session_id)
     if assistant_text.strip():
-        await save_conversation_turn(session_id, "assistant", assistant_text)
+        try:
+            await save_conversation_turn(session_id, "assistant", assistant_text)
+            logger.info("chat() saved assistant turn (%d chars) for session %s", len(assistant_text), session_id)
+        except Exception as save_exc:
+            logger.exception("chat() FAILED to save assistant turn for session %s: %s", session_id, save_exc)
+    else:
+        logger.warning("chat() skipping save: assistant_text is empty for session %s", session_id)
 
     yield {"done": True}
 

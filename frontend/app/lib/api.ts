@@ -176,11 +176,24 @@ function sendViaWebSocket(
 
   ws.onopen = () => { ws.send(JSON.stringify(payload)); };
 
+  let lastEventType = '';
+  let contentChunks = 0;
+
   ws.onmessage = (event) => {
     msgCount++;
     try {
-      const result = handleEvent(JSON.parse(event.data), cb);
-      if (result === 'done') { gotDone = true; cleanup(); }
+      const parsed = JSON.parse(event.data);
+      if (parsed.content) { contentChunks++; lastEventType = 'content'; }
+      else if (parsed.done) { lastEventType = 'done'; }
+      else if (parsed.tool_use_start) { lastEventType = 'tool_use_start'; }
+      else if (parsed.tool_result) { lastEventType = 'tool_result'; }
+      else { lastEventType = Object.keys(parsed)[0] || 'unknown'; }
+
+      const result = handleEvent(parsed, cb);
+      if (result === 'done') {
+        console.log(`[chat] WS done: ${msgCount} msgs, ${contentChunks} content chunks, lastBefore=${lastEventType}`);
+        gotDone = true; cleanup();
+      }
       else if (result === 'error') { gotDone = true; cleanup(); }
     } catch {
       cb.onChunk({ content: event.data });
@@ -188,9 +201,11 @@ function sendViaWebSocket(
   };
 
   ws.onerror = () => {
+    console.log(`[chat] WS error: ${msgCount} msgs received, gotDone=${gotDone}`);
     if (!gotDone) { gotDone = true; cb.onError(new Error('WebSocket connection failed')); }
   };
   ws.onclose = () => {
+    console.log(`[chat] WS close: ${msgCount} msgs, ${contentChunks} content, gotDone=${gotDone}`);
     if (!gotDone) { gotDone = true; cb.onDone(); }
   };
 }
