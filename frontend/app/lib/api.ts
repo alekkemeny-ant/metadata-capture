@@ -80,7 +80,7 @@ export async function fetchModels(): Promise<ModelInfo> {
     if (!res.ok) throw new Error('Failed to fetch models');
     return res.json();
   } catch {
-    return { models: ['claude-opus-4-6', 'claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001'], default: 'claude-opus-4-6' };
+    return { models: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'], default: 'claude-sonnet-4-6' };
   }
 }
 
