@@ -597,6 +597,15 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
     streamSubRef.current?.();
     streamSubRef.current = null;
 
+    // Clear pending attachments — they belong to the session the user
+    // was composing in, not the one they switched to. Must happen
+    // before the live-stream early return below.
+    setPendingFiles((prev) => {
+      prev.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
+      return [];
+    });
+    setExtractionStatus({});
+
     // Check for a live stream already running for this session.
     const live = getStreamForSession(sessionId);
     if (live && !live.done) {

@@ -13,7 +13,12 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from agent.service import _build_multimodal_content, _format_conversation_context
+from agent.service import (
+    _IMAGE_MAX_RAW_BYTES,
+    _build_multimodal_content,
+    _format_conversation_context,
+    _resize_image_for_api,
+)
 
 # Sync tests drive coroutines via run_until_complete — same pattern as
 # test_extractors.py. Keeps us independent of the session-scoped conftest loop.
@@ -429,3 +434,96 @@ def test_extraction_semaphore_limits_concurrency():
         _run(drive())
 
     assert max_concurrent == 3, f"expected exactly 3 concurrent (limit), got {max_concurrent}"
+
+
+# ---------------------------------------------------------------------------
+# _resize_image_for_api: keep every image block under the CLI's 5MB base64 cap
+# ---------------------------------------------------------------------------
+
+
+def _make_png(width: int, height: int, noise: bool = False) -> bytes:
+    """Generate a PNG of the given dimensions. Noise defeats compression."""
+    import io
+    import random
+    from PIL import Image
+    if noise:
+        random.seed(0)
+        data = bytes(random.randrange(256) for _ in range(width * height * 3))
+        img = Image.frombytes("RGB", (width, height), data)
+    else:
+        img = Image.new("RGB", (width, height), (200, 100, 50))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_resize_passthrough_small_image():
+    small = _make_png(100, 100)
+    assert len(small) < _IMAGE_MAX_RAW_BYTES
+    out, mt = _resize_image_for_api(small, "image/png")
+    assert out is small
+    assert mt == "image/png"
+
+
+def test_resize_large_image_fits_under_limit():
+    # Noise-filled PNG: incompressible, so 1400x1400x3 ≈ 5.9MB raw → well over
+    big = _make_png(1400, 1400, noise=True)
+    assert len(big) > _IMAGE_MAX_RAW_BYTES, f"test image only {len(big)} bytes, need bigger"
+    out, mt = _resize_image_for_api(big, "image/png")
+    assert len(out) <= _IMAGE_MAX_RAW_BYTES
+    assert mt == "image/jpeg"
+    # base64 of 3.5MB raw ≈ 4.67MB — under the CLI's 5MB string-length check
+    b64_len = len(base64.standard_b64encode(out))
+    assert b64_len < 5 * 1024 * 1024
+
+
+def test_resize_rgba_flattened_to_rgb():
+    import io
+    from PIL import Image
+    img = Image.new("RGBA", (2000, 2000), (255, 0, 0, 128))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    raw = buf.getvalue()
+    # Solid-color PNG compresses tiny; pad check
+    if len(raw) <= _IMAGE_MAX_RAW_BYTES:
+        # Force the resize path by monkeypatching — simpler: just verify
+        # the function doesn't crash on RGBA when it *does* resize
+        raw = raw + b"\x00" * (_IMAGE_MAX_RAW_BYTES + 1 - len(raw))
+        # Padding breaks the PNG; instead generate noise RGBA
+        import random
+        random.seed(1)
+        data = bytes(random.randrange(256) for _ in range(1200 * 1200 * 4))
+        img = Image.frombytes("RGBA", (1200, 1200), data)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        raw = buf.getvalue()
+    assert len(raw) > _IMAGE_MAX_RAW_BYTES
+    out, mt = _resize_image_for_api(raw, "image/png")
+    assert mt == "image/jpeg"
+    # Verify JPEG is valid and RGB
+    decoded = Image.open(io.BytesIO(out))
+    assert decoded.mode == "RGB"
+
+
+def test_resize_garbage_bytes_passthrough():
+    """Unparseable input falls back to original — don't crash the chat."""
+    junk = b"not an image" * 400_000  # > limit
+    out, mt = _resize_image_for_api(junk, "image/png")
+    assert out is junk
+    assert mt == "image/png"
+
+
+def test_build_multimodal_resizes_oversized_native_image():
+    """End-to-end: oversized PNG on disk → resized JPEG in content block."""
+    big = _make_png(1400, 1400, noise=True)
+    assert len(big) > _IMAGE_MAX_RAW_BYTES
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "huge.png"
+        p.write_bytes(big)
+        att = [{"file_path": str(p), "content_type": "image/png", "filename": "huge.png"}]
+        blocks = _run(_build_multimodal_content("what is this", att))
+    assert len(blocks) == 2
+    assert blocks[0]["type"] == "image"
+    assert blocks[0]["source"]["media_type"] == "image/jpeg"
+    # The base64 payload itself must be under the CLI's check
+    assert len(blocks[0]["source"]["data"]) < 5 * 1024 * 1024

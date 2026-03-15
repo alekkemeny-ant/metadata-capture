@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -207,6 +208,63 @@ async def _create_message_stream(prompt: str | list[dict[str, Any]]):
     }
 
 
+# The Claude Code CLI's validateImagesForAPI rejects any image whose base64
+# string length exceeds ~5MB. Base64 inflates bytes by 4/3, so raw bytes must
+# stay under 5 * 3/4 = 3.75MB. We aim lower (3.5MB) for headroom. Claude's
+# vision model downscales to 1568px internally anyway, so pre-resizing to
+# that dimension loses no model-visible detail.
+_IMAGE_MAX_RAW_BYTES = 3_500_000
+_IMAGE_MAX_DIMENSION = 1568
+
+
+def _resize_image_for_api(raw: bytes, content_type: str) -> tuple[bytes, str]:
+    """Shrink an image to fit the API's 5MB base64 limit.
+
+    Returns (bytes, media_type). If the input is already small enough it's
+    returned unchanged. Otherwise the image is downscaled to 1568px max
+    dimension and re-encoded as JPEG (q85), which reliably lands under the
+    limit for photographic content like microscopy frames.
+    """
+    if len(raw) <= _IMAGE_MAX_RAW_BYTES:
+        return raw, content_type
+
+    from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception as exc:
+        logger.warning("Pillow failed to open image (%s); sending original bytes", exc)
+        return raw, content_type
+
+    # JPEG can't encode alpha or palette modes — flatten onto white.
+    if img.mode != "RGB":
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode in ("RGBA", "LA"):
+            bg.paste(img, mask=img.split()[-1])
+        else:
+            bg.paste(img.convert("RGB"))
+        img = bg
+
+    img.thumbnail((_IMAGE_MAX_DIMENSION, _IMAGE_MAX_DIMENSION), Image.Resampling.LANCZOS)
+
+    # Drop quality until the encoded result fits. q85 handles almost every
+    # real-world photo at 1568px; the loop is a safety net for pathological
+    # inputs (noise-heavy scans, etc.).
+    out, quality = b"", 0
+    for quality in (85, 75, 60, 45):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        out = buf.getvalue()
+        if len(out) <= _IMAGE_MAX_RAW_BYTES:
+            break
+    logger.info(
+        "Resized image %d → %d bytes (q=%d, %dx%d)",
+        len(raw), len(out), quality, *img.size,
+    )
+    return out, "image/jpeg"
+
+
 async def _build_multimodal_content(
     text_prompt: str, attachments: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -231,6 +289,8 @@ async def _build_multimodal_content(
                 logger.warning("Attachment file not found: %s", file_path)
                 continue
             raw = file_path.read_bytes()
+            if content_type.startswith("image/"):
+                raw, content_type = _resize_image_for_api(raw, content_type)
             b64_data = base64.standard_b64encode(raw).decode("ascii")
             if content_type.startswith("image/"):
                 content_blocks.append({
@@ -278,12 +338,13 @@ async def _build_multimodal_content(
 
         # status == "done": inject extracted images then text
         for img_bytes, caption in extraction["images"]:
+            resized, media_type = _resize_image_for_api(img_bytes, "image/png")
             content_blocks.append({
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": "image/png",
-                    "data": base64.standard_b64encode(img_bytes).decode("ascii"),
+                    "media_type": media_type,
+                    "data": base64.standard_b64encode(resized).decode("ascii"),
                 },
             })
             content_blocks.append({"type": "text", "text": f"[{caption}]"})
