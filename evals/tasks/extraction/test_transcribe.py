@@ -20,7 +20,9 @@ import pytest
 
 from agent.tools.transcribe import (
     TranscriptionUnavailable,
+    _scaled_timeout,
     check_availability,
+    extract_keyframes,
     find_binary,
     to_wav,
     transcribe_wav,
@@ -162,3 +164,95 @@ def test_transcribe_wav_argv_shape(tmp_path):
     # Finally block must clean up both tempfiles.
     assert not out_base.exists()
     assert not (tmp_path / "whisper_out.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Duration-scaled timeouts + keyframe counts (GB-scale video support)
+# ---------------------------------------------------------------------------
+
+
+def test_scaled_timeout_floor():
+    assert _scaled_timeout(0, factor=0.35, floor=120) == 120
+    assert _scaled_timeout(60, factor=0.35, floor=120) == 120  # 21s < floor
+
+
+def test_scaled_timeout_long_form():
+    # 2hr video: 7200 * 0.35 = 2520s ≈ 42min — whisper needs real headroom
+    assert _scaled_timeout(7200, factor=0.35, floor=120) == 2520
+
+
+@pytest.mark.parametrize("duration,expected", [
+    (60,    3),   # 1min → too short for >3 frames
+    (600,   3),   # 10min / 180s = 3.3 → 3
+    (1800,  10),  # 30min / 180s = 10
+    (5400,  20),  # 90min / 180s = 30 → capped at 20
+    (10800, 20),  # 3hr → still capped
+])
+def test_keyframe_count_auto_scales(duration, expected, tmp_path):
+    """count=None derives frame count from ffprobe duration, bounded 3..20."""
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"")
+
+    seen_timestamps: list[float] = []
+
+    # Stub ffmpeg: record the -ss timestamp then write a fake PNG so the
+    # post-spawn size/existence checks pass. Subprocess never actually runs.
+    async def fake_spawn(*argv, **_kw):
+        ss_idx = argv.index("-ss")
+        seen_timestamps.append(float(argv[ss_idx + 1]))
+        Path(argv[-1]).write_bytes(b"\x89PNG fake")
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    with patch("agent.tools.transcribe._probe_duration", new=AsyncMock(return_value=float(duration))), \
+         patch("agent.tools.transcribe.find_binary", return_value="/fake/ffmpeg"), \
+         patch(_SUBPROC_TARGET, side_effect=fake_spawn):
+        frames = _loop.run_until_complete(extract_keyframes(video, count=None))
+
+    assert len(frames) == expected
+    assert len(seen_timestamps) == expected
+    # Evenly spaced: first at 0, last at duration - 0.1
+    assert seen_timestamps[0] == 0.0
+    assert abs(seen_timestamps[-1] - (duration - 0.1)) < 0.01
+
+
+def test_keyframe_unknown_duration_falls_back_to_first_frame(tmp_path):
+    """duration<=0 → can't compute seek points → grab frame 0 only."""
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"")
+
+    async def fake_spawn(*argv, **_kw):
+        Path(argv[-1]).write_bytes(b"\x89PNG")
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    with patch("agent.tools.transcribe._probe_duration", new=AsyncMock(return_value=0.0)), \
+         patch("agent.tools.transcribe.find_binary", return_value="/fake/ffmpeg"), \
+         patch(_SUBPROC_TARGET, side_effect=fake_spawn):
+        frames = _loop.run_until_complete(extract_keyframes(video, count=None))
+
+    assert len(frames) == 1
+
+
+def test_keyframe_explicit_count_not_overridden(tmp_path):
+    """Explicit count=5 wins over auto-scaling, even for a long video."""
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"")
+
+    async def fake_spawn(*argv, **_kw):
+        Path(argv[-1]).write_bytes(b"\x89PNG")
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    with patch("agent.tools.transcribe._probe_duration", new=AsyncMock(return_value=7200.0)), \
+         patch("agent.tools.transcribe.find_binary", return_value="/fake/ffmpeg"), \
+         patch(_SUBPROC_TARGET, side_effect=fake_spawn):
+        frames = _loop.run_until_complete(extract_keyframes(video, count=5))
+
+    assert len(frames) == 5

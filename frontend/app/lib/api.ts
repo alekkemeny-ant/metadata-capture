@@ -84,18 +84,41 @@ export async function fetchModels(): Promise<ModelInfo> {
   }
 }
 
-export async function uploadFile(file: File, sessionId?: string): Promise<UploadedFile> {
+/**
+ * XHR instead of fetch — fetch() has no upload progress API. For a 2.38GB
+ * video over real network this is the difference between a progress bar
+ * and a minute of dead silence.
+ */
+export async function uploadFile(
+  file: File,
+  sessionId?: string,
+  onProgress?: (fraction: number) => void,
+): Promise<UploadedFile> {
   const formData = new FormData();
   formData.append('file', file);
   const url = sessionId
     ? `${API_BASE}/upload?session_id=${encodeURIComponent(sessionId)}`
     : `${API_BASE}/upload`;
-  const res = await fetch(url, { method: 'POST', body: formData });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`Upload failed (${res.status}): ${detail}`);
-  }
-  return res.json();
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    if (onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded / e.total);
+      };
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch { reject(new Error(`Upload returned non-JSON: ${xhr.responseText.slice(0, 200)}`)); }
+      } else {
+        reject(new Error(`Upload failed (${xhr.status}): ${xhr.responseText}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Upload failed: network error'));
+    xhr.send(formData);
+  });
 }
 
 export function getUploadUrl(fileId: string): string {

@@ -68,17 +68,28 @@ async function throttledUpload(
   files: File[],
   sessionId: string | undefined,
   limit: number,
+  onProgress?: (index: number, fraction: number) => void,
 ): Promise<Awaited<ReturnType<typeof uploadFile>>[]> {
   const results = new Array(files.length);
   let cursor = 0;
   const workers = Array.from({ length: Math.min(limit, files.length) }, async () => {
     while (cursor < files.length) {
       const idx = cursor++;
-      results[idx] = await uploadFile(files[idx], sessionId);
+      results[idx] = await uploadFile(
+        files[idx], sessionId,
+        onProgress ? (f) => onProgress(idx, f) : undefined,
+      );
     }
   });
   await Promise.all(workers);
   return results;
+}
+
+const VIDEO_EXTS = new Set(['mp4', 'mov', 'webm', 'mkv']);
+function isVideo(file: File): boolean {
+  if (file.type.startsWith('video/')) return true;
+  const ext = file.name.toLowerCase().split('.').pop() || '';
+  return VIDEO_EXTS.has(ext);
 }
 
 // Compact icon for non-image attachment chips (preview strip + sent messages)
@@ -521,6 +532,9 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
   const [openArtifact, setOpenArtifact] = useState<ArtifactSource | null>(null);
   // Background extraction status per uploaded file (non-image/pdf only)
   const [extractionStatus, setExtractionStatus] = useState<Record<string, 'pending' | 'done' | 'error'>>({});
+  // Per-pending-file upload fraction (0..1) — populated during handleSend's
+  // throttledUpload call, cleared when the chat request goes out.
+  const [uploadProgress, setUploadProgress] = useState<Record<number, number>>({});
   // Dev-only: expose modal opener for e2e tests (no URL route to the modal)
   useEffect(() => {
     if (process.env.NODE_ENV === 'development') {
@@ -605,6 +619,7 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
       return [];
     });
     setExtractionStatus({});
+    setUploadProgress({});
 
     // Check for a live stream already running for this session.
     const live = getStreamForSession(sessionId);
@@ -678,7 +693,11 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
       // Skip OS metadata and hidden dotfiles — webkitdirectory recursively
       // collects everything, including .DS_Store in every subdir.
       if (JUNK_FILES.has(file.name) || file.name.startsWith('.')) continue;
-      if (file.size > 100 * 1024 * 1024) continue;  // 100 MB — matches server MAX_UPLOAD_SIZE
+      // Video gets the big cap — extraction seeks by container index so
+      // size only costs upload time, not processing time. Everything else
+      // stays at 100MB to match server MAX_UPLOAD_SIZE.
+      const cap = isVideo(file) ? 10 * 1024 * 1024 * 1024 : 100 * 1024 * 1024;
+      if (file.size > cap) continue;
       const preview = file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined;
       newAttachments.push({ file, preview });
     }
@@ -687,14 +706,17 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
 
   // Poll /uploads/{id}/extraction until done/error or max attempts.
   // Recursive setTimeout — terminates naturally, no interval to leak.
+  // 1s interval for the first 10s, then 2s — video keyframes take ~20s
+  // for 20 frames, so the old 10s ceiling was too short.
   const pollExtraction = useCallback((fileId: string, attempt = 0) => {
-    if (attempt >= 10 || !mountedRef.current) return;
+    if (attempt >= 40 || !mountedRef.current) return;
     getUploadExtraction(fileId)
       .then((result) => {
         if (!mountedRef.current) return;
         setExtractionStatus((prev) => ({ ...prev, [fileId]: result.status }));
         if (result.status === 'pending') {
-          setTimeout(() => pollExtraction(fileId, attempt + 1), 1000);
+          const delay = attempt < 10 ? 1000 : 2000;
+          setTimeout(() => pollExtraction(fileId, attempt + 1), delay);
         }
       })
       .catch(() => {
@@ -847,6 +869,9 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
           filesToUpload.map((f) => f.file),
           sessionId || undefined,
           4,
+          // Progress ticks arrive at XHR rate; updating state per-tick is
+          // fine — React batches and we're throttled to 4 files in flight.
+          (idx, frac) => setUploadProgress((prev) => ({ ...prev, [idx]: frac })),
         );
         attachmentRefs = uploaded.map((u) => ({
           file_id: u.id,
@@ -861,8 +886,10 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
         });
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Upload failed');
+        setUploadProgress({});
         return;
       }
+      setUploadProgress({});
     }
 
     // Derive a descriptive label from filenames when there's no text — this
@@ -1198,26 +1225,42 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
                   doesn't push the textarea off-screen. pr-1 gives the
                   scrollbar room so the remove button isn't clipped. */}
               <div className="flex flex-wrap gap-2 p-2 pr-1 max-h-44 overflow-y-auto chat-scroll">
-                {pendingFiles.map((att, i) => (
-                  <div key={i} className="relative group">
-                    {att.preview ? (
-                      <img src={att.preview} alt={att.file.name} className="w-16 h-16 rounded-lg object-cover border border-sand-200" />
-                    ) : (
-                      <div className="w-16 h-16 rounded-lg border border-sand-200 bg-white flex flex-col items-center justify-center">
-                        <span className="text-xl leading-none">{fileTypeIcon(att.file.type, att.file.name)}</span>
-                        <span className="text-[9px] text-sand-500 mt-0.5 truncate max-w-[56px] px-1" title={att.file.name}>{att.file.name}</span>
-                      </div>
-                    )}
-                    <button
-                      onClick={() => removeFile(i)}
-                      className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-sand-600 text-white
-                                 flex items-center justify-center text-xs transition-opacity
-                                 opacity-100 md:opacity-0 md:group-hover:opacity-100"
-                    >
-                      &times;
-                    </button>
-                  </div>
-                ))}
+                {pendingFiles.map((att, i) => {
+                  const prog = uploadProgress[i];
+                  return (
+                    <div key={i} className="relative group">
+                      {att.preview ? (
+                        <img src={att.preview} alt={att.file.name} className="w-16 h-16 rounded-lg object-cover border border-sand-200" />
+                      ) : (
+                        <div className="w-16 h-16 rounded-lg border border-sand-200 bg-white flex flex-col items-center justify-center">
+                          <span className="text-xl leading-none">{fileTypeIcon(att.file.type, att.file.name)}</span>
+                          <span className="text-[9px] text-sand-500 mt-0.5 truncate max-w-[56px] px-1" title={att.file.name}>{att.file.name}</span>
+                        </div>
+                      )}
+                      {/* Upload progress overlay — wash fills bottom-up as
+                          XHR progress ticks arrive. Hidden until send. */}
+                      {prog !== undefined && (
+                        <div className="absolute inset-0 rounded-lg overflow-hidden pointer-events-none">
+                          <div className="absolute inset-x-0 bottom-0 bg-brand-fig/30 transition-[height] duration-150"
+                               style={{ height: `${Math.round(prog * 100)}%` }} />
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <span className="text-[10px] font-semibold text-brand-fig bg-white/80 rounded px-1">
+                              {Math.round(prog * 100)}%
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                      <button
+                        onClick={() => removeFile(i)}
+                        className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-sand-600 text-white
+                                   flex items-center justify-center text-xs transition-opacity
+                                   opacity-100 md:opacity-0 md:group-hover:opacity-100"
+                      >
+                        &times;
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

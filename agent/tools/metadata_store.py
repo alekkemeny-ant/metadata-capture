@@ -434,6 +434,45 @@ async def set_upload_extraction(
     )
 
 
+async def append_upload_transcript(
+    upload_id: str, text: str, error: str | None = None,
+) -> None:
+    """Merge a transcript into an existing extraction row without touching
+    the images/status columns.
+
+    Used by the slow video-transcript background task — keyframes already
+    landed and flipped status to 'done', so the user may have already sent
+    their chat. This just fills in the text for follow-up turns.
+    """
+    db = await get_db()
+    row = await db.fetchrow(
+        "SELECT extracted_meta_json, extraction_error FROM uploads WHERE id = ?",
+        (upload_id,),
+    )
+    if row is None:
+        return
+
+    meta = _parse_json(row["extracted_meta_json"]) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["transcript_pending"] = False
+    if error:
+        meta["transcript_error"] = error
+
+    # Preserve any prior error (e.g. partial keyframe failure); append ours.
+    prior_err = row["extraction_error"]
+    merged_err = "; ".join(e for e in (prior_err, error) if e) or None
+
+    await db.execute(
+        """UPDATE uploads
+           SET extracted_text = ?,
+               extracted_meta_json = ?,
+               extraction_error = ?
+           WHERE id = ?""",
+        (text, json.dumps(meta), merged_err, upload_id),
+    )
+
+
 async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
     """Fetch extraction results for an upload.
 

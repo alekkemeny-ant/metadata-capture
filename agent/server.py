@@ -45,11 +45,18 @@ _NATIVE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"})
 # browser reports a generic MIME type.
 ALLOWED_CONTENT_TYPES = NATIVE_TYPES | set(EXTRACTORS.keys())
 ALLOWED_EXTENSIONS = set(EXT_EXTRACTORS.keys()) | _NATIVE_EXTS
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB — video needs headroom
+# Non-video cap stays tight — spreadsheets/docs/images have no business
+# being this large. Video gets its own cap because a 90min experiment
+# recording is legitimately GB-scale; extraction only reads the container
+# index + seeks, so size doesn't hurt past the upload itself.
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024
+MAX_VIDEO_UPLOAD_SIZE = 10 * 1024 * 1024 * 1024
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 # Audio/video: fail fast at upload if ffmpeg/whisper are unavailable rather
 # than accepting the file and erroring 120s later at chat time.
 _AV_EXTS = frozenset({".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".mov", ".webm", ".mkv"})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".webm", ".mkv"})
 
 # Load environment variables from .env file
 load_dotenv()
@@ -444,6 +451,30 @@ async def _extract_and_store(upload_id: str, path: Path, content_type: str) -> N
                 logger.exception("Failed to persist extraction error for %s", upload_id)
 
 
+async def _transcribe_and_append(upload_id: str, path: Path) -> None:
+    """Background: transcribe a video's audio track and merge into the
+    extraction row.
+
+    Runs separately from (and slower than) _extract_and_store — keyframes
+    land first and flip status to 'done' so the user can send; this fills
+    in the transcript for follow-up turns. Not gated on the extraction
+    semaphore: whisper is CPU-bound in a subprocess, not competing with
+    pandas-in-event-loop.
+    """
+    from .tools.metadata_store import append_upload_transcript
+    from .tools.transcribe import TranscriptionUnavailable, transcribe
+
+    try:
+        text = await transcribe(path)
+        await append_upload_transcript(upload_id, text=text)
+    except (TranscriptionUnavailable, asyncio.TimeoutError, Exception) as exc:
+        logger.warning("Video transcript failed for %s: %s", upload_id, exc)
+        try:
+            await append_upload_transcript(upload_id, text="", error=str(exc))
+        except Exception:
+            logger.exception("Failed to persist transcript error for %s", upload_id)
+
+
 @app.post("/upload")
 async def upload_file(file: UploadFile, session_id: str | None = None):
     """Upload a file for use in chat messages.
@@ -465,29 +496,53 @@ async def upload_file(file: UploadFile, session_id: str | None = None):
             detail=f"Unsupported file type: {content_type or '(none)'} / {ext or '(no ext)'}",
         )
 
-    # Audio/video: refuse the upload if ffmpeg/whisper aren't installed.
-    # Better a 503 now than a silent "still processing" forever.
-    if content_type.startswith(("audio/", "video/")) or ext in _AV_EXTS:
-        from .tools.transcribe import check_availability
-        avail = check_availability()
-        if not avail["available"]:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Transcription unavailable: missing {', '.join(avail['missing'])}",
-            )
+    is_video = content_type.startswith("video/") or ext in _VIDEO_EXTS
+    is_audio = content_type.startswith("audio/") or ext in (_AV_EXTS - _VIDEO_EXTS)
 
-    contents = await file.read()
-    if len(contents) > MAX_UPLOAD_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024 * 1024)} MB.",
-        )
+    # Video only strictly needs ffmpeg (keyframes); whisper is optional
+    # (transcript becomes a no-op). Audio strictly needs both. Better a 503
+    # now than a silent "still processing" forever.
+    if is_video or is_audio:
+        from .tools.transcribe import check_availability, find_binary
+        if is_video:
+            if find_binary("ffmpeg") is None:
+                raise HTTPException(status_code=503, detail="Video processing unavailable: ffmpeg not found")
+        else:
+            avail = check_availability()
+            if not avail["available"]:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Transcription unavailable: missing {', '.join(avail['missing'])}",
+                )
 
+    # Stream to disk instead of buffering in RAM — a 2.38GB video would
+    # otherwise spike the heap by 2.38GB. UploadFile.file is a
+    # SpooledTemporaryFile that's already on disk for large bodies, so this
+    # is a disk→disk copy. Size is enforced mid-stream so a hostile
+    # oversized body doesn't fill the disk before the check.
+    size_cap = MAX_VIDEO_UPLOAD_SIZE if is_video else MAX_UPLOAD_SIZE
     file_id = str(uuid.uuid4())
     dest_ext = ext or ".bin"
     dest = UPLOADS_DIR / f"{file_id}{dest_ext}"
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(contents)
+
+    size_bytes = 0
+    try:
+        with dest.open("wb") as out:
+            while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
+                size_bytes += len(chunk)
+                if size_bytes > size_cap:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum is {size_cap // (1024*1024)} MB.",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Upload write failed: {exc}")
 
     # Native types (images, PDFs) go directly to Claude at chat time — no
     # extraction pipeline. Mark them 'done' at insert so the frontend's
@@ -499,7 +554,7 @@ async def upload_file(file: UploadFile, session_id: str | None = None):
         original_filename=file.filename or "unknown",
         content_type=content_type,
         file_path=str(dest),
-        size_bytes=len(contents),
+        size_bytes=size_bytes,
         session_id=session_id,
         initial_status="done" if is_native else "pending",
     )
@@ -509,6 +564,13 @@ async def upload_file(file: UploadFile, session_id: str | None = None):
     # 'done'/'error' when the task finishes.
     if not is_native:
         asyncio.create_task(_extract_and_store(file_id, dest, content_type))
+        # Video: transcript runs as a second, slower task. Keyframes (above)
+        # finish in ~20s and flip status to 'done'; transcript lands minutes
+        # later and merges into the row via append_upload_transcript.
+        if is_video:
+            from .tools.transcribe import check_availability
+            if check_availability()["available"]:
+                asyncio.create_task(_transcribe_and_append(file_id, dest))
 
     return result
 

@@ -13,7 +13,18 @@ from pathlib import Path
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 MODEL_FILENAME = "ggml-base.en.bin"
+# Legacy constant kept for short-clip paths; long-form uses _scaled_timeout.
 TRANSCRIBE_TIMEOUT_SEC = 120
+# whisper.cpp base.en runs ~4-8× realtime on CPU. 0.35× duration gives
+# headroom above the worst case; floor keeps short clips from getting
+# unreasonably tight budgets.
+_WHISPER_TIMEOUT_FACTOR = 0.35
+_WHISPER_TIMEOUT_FLOOR_SEC = 120
+# One frame per ~3min of footage, bounded. 20 frames × ~500KB ≈ 10MB of
+# image blocks — comfortably inside a single API request.
+_KEYFRAME_MIN = 3
+_KEYFRAME_MAX = 20
+_KEYFRAME_SEC_PER_FRAME = 180
 
 
 class TranscriptionUnavailable(RuntimeError):
@@ -68,12 +79,20 @@ async def _run(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
     return proc.returncode or 0, stdout, stderr
 
 
-async def to_wav(src: Path) -> Path:
+def _scaled_timeout(duration_sec: float, factor: float, floor: float) -> float:
+    return max(floor, duration_sec * factor)
+
+
+async def to_wav(src: Path, duration_hint: float = 0.0) -> Path:
     """Convert any audio/video source to 16kHz mono PCM WAV via ffmpeg.
 
     Returns path to a tempfile. Caller is responsible for deleting it on
     success. On any exception (including TimeoutError), the tempfile is
     unlinked before the exception is re-raised (staff review P1#4).
+
+    duration_hint scales the timeout for long-form sources — ffmpeg has to
+    decode+re-encode the full audio stream, so a 2hr video needs minutes,
+    not the 60s that was fine for short clips.
     """
     ffmpeg = find_binary("ffmpeg")
     if ffmpeg is None:
@@ -82,6 +101,10 @@ async def to_wav(src: Path) -> Path:
     fd, tmp_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
     dst = Path(tmp_path)
+
+    # ffmpeg audio transcode runs well above realtime; 0.05× duration is
+    # generous. Floor at 60s for short clips.
+    timeout = _scaled_timeout(duration_hint, factor=0.05, floor=60)
 
     argv = [
         ffmpeg, "-y",
@@ -93,7 +116,7 @@ async def to_wav(src: Path) -> Path:
         str(dst),
     ]
     try:
-        rc, _, stderr = await _run(argv, timeout=60)
+        rc, _, stderr = await _run(argv, timeout=timeout)
     except Exception:
         dst.unlink(missing_ok=True)
         raise
@@ -105,11 +128,11 @@ async def to_wav(src: Path) -> Path:
     return dst
 
 
-async def transcribe_wav(wav: Path) -> str:
+async def transcribe_wav(wav: Path, duration_hint: float = 0.0) -> str:
     """Run whisper-cli against a 16kHz WAV file and return the transcript.
 
     whisper-cli writes {out_base}.txt; we read, strip, unlink, and return.
-    Uses TRANSCRIBE_TIMEOUT_SEC (120s).
+    Timeout scales with duration_hint — base.en runs ~4-8× realtime on CPU.
     """
     whisper = find_binary("whisper-cli")
     if whisper is None:
@@ -125,6 +148,10 @@ async def transcribe_wav(wav: Path) -> str:
     out_base = Path(out_base_path)
     out_txt = out_base.with_suffix(".txt")
 
+    timeout = _scaled_timeout(
+        duration_hint, _WHISPER_TIMEOUT_FACTOR, _WHISPER_TIMEOUT_FLOOR_SEC,
+    )
+
     argv = [
         whisper,
         "-m", str(model),
@@ -134,7 +161,7 @@ async def transcribe_wav(wav: Path) -> str:
         "-np",
     ]
     try:
-        rc, _, stderr = await _run(argv, timeout=TRANSCRIBE_TIMEOUT_SEC)
+        rc, _, stderr = await _run(argv, timeout=timeout)
         if rc != 0:
             raise RuntimeError(
                 f"whisper-cli failed ({rc}): {stderr.decode(errors='replace')[:500]}"
@@ -148,9 +175,10 @@ async def transcribe_wav(wav: Path) -> str:
 
 async def transcribe(src: Path) -> str:
     """Convert source to WAV, transcribe it, clean up the WAV tempfile."""
-    wav = await to_wav(src)
+    duration = await _probe_duration(src)
+    wav = await to_wav(src, duration_hint=duration)
     try:
-        return await transcribe_wav(wav)
+        return await transcribe_wav(wav, duration_hint=duration)
     finally:
         wav.unlink(missing_ok=True)
 
@@ -176,11 +204,13 @@ async def _probe_duration(src: Path) -> float:
         return 0.0
 
 
-async def extract_keyframes(src: Path, count: int = 3) -> list[tuple[bytes, str]]:
-    """Pull N evenly-spaced PNG frames from a video.
+async def extract_keyframes(src: Path, count: int | None = None) -> list[tuple[bytes, str]]:
+    """Pull evenly-spaced PNG frames from a video.
 
+    count=None auto-scales with duration (~1 frame per 3min, bounded 3..20).
     Timestamps are clamped to [0, duration - 0.1]. Uses -ss before -i for
-    fast seeking. Frames are scaled to 1024px wide (aspect preserved).
+    fast seeking — per-frame cost is constant regardless of file size.
+    Frames are scaled to 1024px wide (aspect preserved).
 
     Returns [(png_bytes, "Frame at {ts}s"), ...].
     """
@@ -189,6 +219,13 @@ async def extract_keyframes(src: Path, count: int = 3) -> list[tuple[bytes, str]
         raise TranscriptionUnavailable("ffmpeg not found on PATH")
 
     duration = await _probe_duration(src)
+
+    if count is None:
+        if duration > 0:
+            count = max(_KEYFRAME_MIN, min(_KEYFRAME_MAX, int(duration // _KEYFRAME_SEC_PER_FRAME)))
+        else:
+            count = _KEYFRAME_MIN
+
     if duration <= 0:
         # No usable duration — just grab the first frame.
         timestamps = [0.0]

@@ -218,92 +218,70 @@ def test_extract_audio_unavailable(tmp_path):
 # Video extractor (mocked)
 # ---------------------------------------------------------------------------
 
-def test_extract_video_mocked(tmp_path):
-    """Both transcript and keyframes succeed → text + images populated."""
+def test_extract_video_keyframes_only(tmp_path):
+    """Video extract is now the fast keyframes-only path; transcript is
+    a separate background task scheduled by server.py."""
     video = tmp_path / "fake.mp4"
     video.write_bytes(b"")
 
-    fake_transcript = "This clip shows the rig in operation."
     fake_frames = [
         (b"\x89PNG frame 0", "Frame at 0.0s"),
         (b"\x89PNG frame 1", "Frame at 5.0s"),
         (b"\x89PNG frame 2", "Frame at 10.0s"),
     ]
-    with patch("agent.tools.transcribe.transcribe", new=AsyncMock(return_value=fake_transcript)), \
-         patch("agent.tools.transcribe.extract_keyframes", new=AsyncMock(return_value=fake_frames)):
+    with patch("agent.tools.transcribe.extract_keyframes", new=AsyncMock(return_value=fake_frames)), \
+         patch("agent.tools.transcribe._probe_duration", new=AsyncMock(return_value=10.5)):
         result = _run(extract(video, "video/mp4"))
 
     assert result.error is None
-    assert result.text == fake_transcript
+    assert result.text == ""  # transcript is not this function's job anymore
     assert result.images == fake_frames
-    assert result.meta["transcribed"] is True
     assert result.meta["keyframes"] == 3
+    assert result.meta["transcript_pending"] is True
+    assert result.meta["duration_sec"] == 10.5
 
 
-def test_extract_video_partial_success(tmp_path):
-    """Transcription fails but keyframes succeed → images populated, error set, text empty."""
+def test_extract_video_keyframe_failure(tmp_path):
+    """ffmpeg failure → error result, transcript_pending=False (nothing to wait for)."""
     video = tmp_path / "fake.mov"
     video.write_bytes(b"")
 
-    fake_frames = [(b"\x89PNG only frame", "Frame at 2.5s")]
     with patch(
-        "agent.tools.transcribe.transcribe",
-        new=AsyncMock(side_effect=RuntimeError("whisper crashed")),
-    ), patch(
         "agent.tools.transcribe.extract_keyframes",
-        new=AsyncMock(return_value=fake_frames),
+        new=AsyncMock(side_effect=RuntimeError("ffmpeg exited 1")),
     ):
         result = _run(extract(video, "video/quicktime"))
 
-    # Partial success: keyframes made it through.
-    assert result.images == fake_frames
+    assert result.images == []
     assert result.text == ""
     assert result.error is not None
-    assert "Transcription failed" in result.error
-    assert "whisper crashed" in result.error
-    assert result.meta["transcribed"] is False
-    assert result.meta["keyframes"] == 1
+    assert "ffmpeg exited 1" in result.error
+    assert result.meta["keyframes"] == 0
+    assert result.meta["transcript_pending"] is False
 
 
-def test_extract_video_reraises_keyboard_interrupt(tmp_path):
-    """cb5a470: KeyboardInterrupt must propagate through extract(), not be
-    swallowed by the blanket except-Exception or stringified into .error.
-
-    gather(return_exceptions=True) may either return it as a value (older
-    Pythons) or propagate it directly (3.11+) — either way extract_video's
-    BaseException re-raise loop and extract()'s except-Exception guarantee
-    it reaches the caller.
-    """
+def test_extract_video_empty_frames(tmp_path):
+    """All seeks fail individually → empty list → error, not silent success."""
     video = tmp_path / "fake.webm"
     video.write_bytes(b"")
 
-    # Yield once before raising so the sibling _frames() task gets a loop
-    # tick to run to completion. Without this, KeyboardInterrupt tears out
-    # of the loop before _frames is ever stepped, leaving an unawaited
-    # coroutine that warns at GC time.
-    async def _interrupt_after_yield(*args, **kwargs):
-        await asyncio.sleep(0)
+    with patch("agent.tools.transcribe.extract_keyframes", new=AsyncMock(return_value=[])):
+        result = _run(extract(video, "video/webm"))
+
+    assert result.error is not None
+    assert "no frames" in result.error.lower()
+    assert result.meta["transcript_pending"] is False
+
+
+def test_extract_video_reraises_keyboard_interrupt(tmp_path):
+    """KeyboardInterrupt propagates — extract_video's try/except only
+    catches Exception, and extract()'s dispatch wrapper does the same."""
+    video = tmp_path / "fake.webm"
+    video.write_bytes(b"")
+
+    async def _interrupt(*a, **kw):
         raise KeyboardInterrupt
 
-    # Use a throwaway loop — not the module-level _loop. KeyboardInterrupt
-    # tearing through run_until_complete can leave callbacks queued; if we
-    # later re-enter the same loop, those callbacks re-deliver the interrupt
-    # into pytest. A fresh loop that we close immediately contains the
-    # blast radius.
-    local = asyncio.new_event_loop()
-    local.set_exception_handler(lambda loop, context: None)
-    try:
-        with patch(
-            "agent.tools.transcribe.transcribe",
-            new=_interrupt_after_yield,
-        ), patch(
-            "agent.tools.transcribe.extract_keyframes",
-            new=AsyncMock(return_value=[]),
-        ):
-            with pytest.raises(KeyboardInterrupt):
-                local.run_until_complete(extract(video, "video/webm"))
-    finally:
-        for t in asyncio.all_tasks(local):
-            if t.done() and not t.cancelled():
-                t.exception()  # mark retrieved → no "exception never retrieved" at GC
-        local.close()
+    with patch("agent.tools.transcribe.extract_keyframes", new=_interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            _run(extract(video, "video/webm"))

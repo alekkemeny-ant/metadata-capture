@@ -202,58 +202,36 @@ async def extract_audio(path: Path, content_type: str) -> ExtractedContent:
     exts=(".mp4", ".mov", ".webm", ".mkv"),
 )
 async def extract_video(path: Path, content_type: str) -> ExtractedContent:
-    """Transcribe audio track + pull keyframes. Partial success is OK."""
+    """Keyframes only — the fast path for video.
+
+    Frame count auto-scales with duration (3..20, ~1/3min). Transcription
+    runs as a separate background task (server.py schedules it) that
+    appends to the extraction row later; this function returning 'done'
+    means the user can hit send, not that transcription is finished.
+    """
     from . import transcribe as T  # lazy
 
-    async def _transcribe() -> str:
-        return await T.transcribe(path)
-
-    async def _frames() -> list[tuple[bytes, str]]:
-        return await T.extract_keyframes(path, count=3)
-
-    transcript_r, frames_r = await asyncio.gather(
-        _transcribe(), _frames(), return_exceptions=True
-    )
-
-    text = ""
-    images: list[tuple[bytes, str]] = []
-    errors: list[str] = []
-
-    # gather(return_exceptions=True) surfaces BaseException subclasses as values.
-    # Re-raise BaseException-but-not-Exception (KeyboardInterrupt, SystemExit,
-    # GeneratorExit) — those must propagate, not be stringified into .error.
-    for r in (transcript_r, frames_r):
-        if isinstance(r, BaseException) and not isinstance(r, Exception):
-            raise r
-
-    if isinstance(transcript_r, Exception):
-        if isinstance(transcript_r, asyncio.TimeoutError):
-            errors.append(f"Transcription timed out after {T.TRANSCRIBE_TIMEOUT_SEC}s")
-        else:
-            errors.append(f"Transcription failed: {transcript_r}")
-    else:
-        text = transcript_r
-
-    if isinstance(frames_r, Exception):
-        errors.append(f"Keyframe extraction failed: {frames_r}")
-    else:
-        images = frames_r
-
-    transcribed = not isinstance(transcript_r, Exception)
-    n_frames = len(images)
-
-    # Both failed → error-only result.
-    if not transcribed and n_frames == 0:
+    try:
+        frames = await T.extract_keyframes(path, count=None)
+    except Exception as e:
         return ExtractedContent(
-            text="",
-            error="; ".join(errors) if errors else "Video extraction produced no content",
-            meta={"transcribed": False, "keyframes": 0},
+            text="", error=f"Keyframe extraction failed: {e}",
+            meta={"keyframes": 0, "transcript_pending": False},
         )
 
-    # Partial success: whichever half failed goes in .error.
+    if not frames:
+        return ExtractedContent(
+            text="", error="Keyframe extraction produced no frames",
+            meta={"keyframes": 0, "transcript_pending": False},
+        )
+
+    duration = await T._probe_duration(path)
     return ExtractedContent(
-        text=text,
-        images=images,
-        meta={"transcribed": transcribed, "keyframes": n_frames},
-        error="; ".join(errors) if errors else None,
+        text="",
+        images=frames,
+        meta={
+            "keyframes": len(frames),
+            "duration_sec": round(duration, 1),
+            "transcript_pending": True,
+        },
     )

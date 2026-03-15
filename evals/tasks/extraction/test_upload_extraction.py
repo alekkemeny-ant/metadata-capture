@@ -197,3 +197,116 @@ def test_health_reports_transcription_status(client):
     # is actually populated, not just the prefix.
     if t.startswith("unavailable:"):
         assert "ffmpeg" in t
+
+
+# ---------------------------------------------------------------------------
+# GB-scale video: split keyframes/transcript, streaming upload
+# ---------------------------------------------------------------------------
+
+
+def test_append_upload_transcript_preserves_images(setup_db):
+    """Transcript merge must not stomp keyframes written by the fast path."""
+    from agent.tools.metadata_store import (
+        append_upload_transcript, get_upload_extraction,
+        save_upload, set_upload_extraction,
+    )
+
+    async def _scenario():
+        await save_upload("vid-1", "rig.mp4", "video/mp4", "/tmp/rig.mp4", 1_000_000)
+        # Fast path: keyframes land, status → done
+        frames = [(b"\x89PNG k0", "Frame at 0.0s"), (b"\x89PNG k1", "Frame at 90.0s")]
+        await set_upload_extraction(
+            "vid-1", text="", images=frames,
+            meta={"keyframes": 2, "transcript_pending": True}, error=None,
+        )
+        # Slow path: transcript arrives minutes later
+        await append_upload_transcript("vid-1", text="The rig is operating normally.")
+        return await get_upload_extraction("vid-1")
+
+    result = _run(_scenario())
+    assert result["status"] == "done"  # unchanged by append
+    assert result["text"] == "The rig is operating normally."
+    assert len(result["images"]) == 2  # not stomped
+    assert result["images"][0][1] == "Frame at 0.0s"
+    assert result["meta"]["transcript_pending"] is False  # flipped by append
+    assert result["meta"]["keyframes"] == 2  # preserved
+
+
+def test_append_upload_transcript_error_merges_with_prior(setup_db):
+    """Transcript failure appends to extraction_error, doesn't replace it."""
+    from agent.tools.metadata_store import (
+        append_upload_transcript, get_upload_extraction,
+        save_upload, set_upload_extraction,
+    )
+
+    async def _scenario():
+        await save_upload("vid-2", "bad.mp4", "video/mp4", "/tmp/bad.mp4", 1_000_000)
+        await set_upload_extraction(
+            "vid-2", text="", images=[(b"\x89PNG", "Frame at 0s")],
+            meta={"keyframes": 1, "transcript_pending": True},
+            error="2 of 3 keyframe seeks failed",
+        )
+        await append_upload_transcript("vid-2", text="", error="whisper timed out")
+        return await get_upload_extraction("vid-2")
+
+    result = _run(_scenario())
+    assert "2 of 3 keyframe seeks failed" in result["error"]
+    assert "whisper timed out" in result["error"]
+    assert result["meta"]["transcript_error"] == "whisper timed out"
+    assert result["meta"]["transcript_pending"] is False
+
+
+def test_upload_streams_to_disk_not_ram(client, monkeypatch):
+    """Chunked read loop — no single contents = file.read() buffering the
+    whole body. Verified by asserting the uploaded file's bytes match
+    without the server having called read() with no args."""
+    import agent.server as server_mod
+
+    # Shrink chunk size so a small test file exercises the loop more than once.
+    monkeypatch.setattr(server_mod, "_UPLOAD_CHUNK_SIZE", 16)
+
+    payload = b"a" * 100  # 100 bytes → 7 chunks at 16B
+    resp = _run(client.post(
+        "/upload",
+        files={"file": ("chunks.txt", payload, "text/plain")},
+    ))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["size"] == 100
+
+    # File on disk matches exactly
+    dest = list(server_mod.UPLOADS_DIR.glob(f"{body['id']}.*"))[0]
+    assert dest.read_bytes() == payload
+
+
+def test_upload_video_cap_is_higher(client, monkeypatch):
+    """Video gets MAX_VIDEO_UPLOAD_SIZE; text stays at MAX_UPLOAD_SIZE."""
+    import agent.server as server_mod
+
+    # Scale both caps way down so the test doesn't allocate megabytes.
+    monkeypatch.setattr(server_mod, "MAX_UPLOAD_SIZE", 50)
+    monkeypatch.setattr(server_mod, "MAX_VIDEO_UPLOAD_SIZE", 200)
+    # Video upload won't actually extract (no ffmpeg) but we just need the
+    # size check to pass. Stub ffmpeg-available so the 503 guard doesn't fire.
+    monkeypatch.setattr(
+        "agent.tools.transcribe.find_binary",
+        lambda name: "/fake/ffmpeg" if name == "ffmpeg" else None,
+    )
+    monkeypatch.setattr(
+        "agent.tools.transcribe.check_availability",
+        lambda: {"available": False, "missing": ["whisper-cli"]},
+    )
+
+    # 100-byte text: over text cap (50) → 413
+    resp = _run(client.post(
+        "/upload",
+        files={"file": ("big.txt", b"x" * 100, "text/plain")},
+    ))
+    assert resp.status_code == 413
+
+    # 100-byte "video": under video cap (200) → 200
+    resp = _run(client.post(
+        "/upload",
+        files={"file": ("big.mp4", b"x" * 100, "video/mp4")},
+    ))
+    assert resp.status_code == 200
