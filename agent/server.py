@@ -64,12 +64,25 @@ async def lifespan(app: FastAPI):
     (no API key, missing MCP deps, etc.), we log and continue — chat()
     falls back to one-shot query() which has the same failure surface.
     """
-    await init_db()
+    print("[lifespan] Initializing database...", flush=True)
+    try:
+        await init_db()
+        print("[lifespan] Database initialized OK", flush=True)
+    except Exception:
+        logger.exception("Database initialization failed — continuing without DB")
 
-    if os.environ.get("USE_SDK_POOL", "1") == "1":
+    if os.environ.get("USE_SDK_POOL", "0") == "1":
         pool = init_pool(_get_options)
+        print("[lifespan] Warming SDK client pool...", flush=True)
         try:
-            await pool.warmup()
+            await asyncio.wait_for(pool.warmup(), timeout=30)
+            print("[lifespan] SDK client pool warm", flush=True)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "SDK client pool warmup timed out after 30s — chat() will fall back to "
+                "per-request query() (~4s slower)."
+            )
+            print("[lifespan] SDK client pool warmup timed out", flush=True)
         except Exception:
             logger.exception(
                 "SDK client pool warmup failed — chat() will fall back to "
@@ -145,13 +158,18 @@ async def chat_endpoint(req: ChatRequest):
 
     async def event_stream():
         queue: asyncio.Queue[str | None] = asyncio.Queue()
+        evt_count = 0
 
         async def _produce():
+            nonlocal evt_count
             try:
                 async for chunk in chat(session_id, req.message, model=req.model, attachments=attachments):
+                    evt_count += 1
                     await queue.put(f"data: {json.dumps(chunk)}\n\n")
+                logger.info("SSE producer: chat() finished, %d events yielded, sending [DONE]", evt_count)
                 await queue.put("data: [DONE]\n\n")
             except Exception as exc:
+                logger.exception("SSE producer error after %d events: %s", evt_count, exc)
                 await queue.put(f"data: {json.dumps({'error': str(exc)})}\n\n")
             finally:
                 await queue.put(None)
@@ -167,12 +185,16 @@ async def chat_endpoint(req: ChatRequest):
                 if item is None:
                     break
                 yield item
+        except GeneratorExit:
+            logger.warning("SSE consumer: GeneratorExit after %d events (client disconnected mid-stream)", evt_count)
+            raise
         finally:
             producer.cancel()
             try:
                 await producer
             except (asyncio.CancelledError, Exception):
                 pass
+            logger.info("SSE consumer: stream ended, %d events total", evt_count)
 
     return StreamingResponse(
         event_stream(),
@@ -182,6 +204,7 @@ async def chat_endpoint(req: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -630,3 +653,5 @@ async def health():
         "transcription": "available" if avail["available"]
                          else f"unavailable: {', '.join(avail['missing'])}",
     }
+
+

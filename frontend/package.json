@@ -4,8 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "next dev -H 0.0.0.0 -p 5000",
+    "dev:replit": "node server.mjs",
     "build": "next build",
     "start": "next start -H 0.0.0.0 -p 5000",
+    "start:replit": "NODE_ENV=production node server.mjs",
     "lint": "next lint",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -16,7 +18,8 @@
     "react": "^18",
     "react-dom": "^18",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",

@@ -1,19 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  allowedDevOrigins: ['*'],
+  allowedDevOrigins: ['*.replit.dev', '*.repl.co', '*.replit.app', '*.kirk.replit.dev'],
   eslint: {
     ignoreDuringBuilds: true,
   },
   env: {
-    // Use ?? not || so an explicit empty string ("use rewrites proxy") is
-    // respected. With ||, `NEXT_PUBLIC_API_URL=` falls through to the
-    // localhost:8001 default and the browser hits the wrong host when
-    // port-forwarding from a laptop.
     NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8001',
   },
   async rewrites() {
     return [
-      { source: '/chat', destination: 'http://localhost:8001/chat' },
       { source: '/records', destination: 'http://localhost:8001/records' },
       { source: '/records/:path*', destination: 'http://localhost:8001/records/:path*' },
       { source: '/sessions', destination: 'http://localhost:8001/sessions' },
@@ -24,6 +19,7 @@ const nextConfig = {
       { source: '/uploads/:path*', destination: 'http://localhost:8001/uploads/:path*' },
       { source: '/artifacts/:path*', destination: 'http://localhost:8001/artifacts/:path*' },
       { source: '/schema/:path*', destination: 'http://localhost:8001/schema/:path*' },
+      { source: '/chat', destination: 'http://localhost:8001/chat' },
     ];
   },
   async headers() {

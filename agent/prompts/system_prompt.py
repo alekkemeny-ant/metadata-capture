@@ -63,13 +63,21 @@ change it, and the edit writes back to the source record.
 
 ## AIND Metadata MCP Tools
 
-You also have access to the aind-metadata-mcp server for querying the live AIND MongoDB:
-- **get_records**: Query metadata records with filters
+You have access to the aind-metadata-mcp server for querying the live AIND MongoDB. \
+These are your primary tools for looking up real data in the AIND production database:
+- **get_records**: Query metadata records with MongoDB filters and projections
+- **count_records**: Count records matching a MongoDB filter (use for "how many X" questions)
+- **aggregation_retrieval**: Run full MongoDB aggregation pipelines for complex analytics
 - **get_project_names**: List all valid project names
 - **get_modality_types**: List all valid modality types
-- **get_*_example**: Get example records for reference
-- **get_top_level_nodes**: Get the schema structure
-- **get_additional_schema_help**: Get detailed field documentation
+- **get_*_example**: Get example records showing schema structure for each metadata type
+- **get_top_level_nodes**: Get the top-level schema structure
+- **get_additional_schema_help**: Get detailed field documentation and query patterns
+
+When a user asks about data in the AIND database (e.g., "how many exaSPIM subjects?", \
+"list projects", "find records for subject X"), ALWAYS use these AIND MCP tools. \
+Do NOT confuse them with the local capture tools (find_records searches only locally \
+captured records, not the production database).
 
 ## Key Field Paths
 

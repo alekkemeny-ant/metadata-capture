@@ -1020,8 +1020,6 @@ export default function ChatPanel({ sessionId, newChatNonce, onSessionChange, ag
         sid ||= sessionStorage.getItem('chat_session_id');
         if (sid) saveMessagesToStorage(sid, entry.messages);
         notify(true);
-        // Registry cleanup — entry is no longer live, future session
-        // loads go via DB + localStorage.
         streamRegistry.delete(registryKey);
       },
       (err) => {

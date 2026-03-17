@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -53,15 +54,14 @@ AVAILABLE_MODELS = [
 def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     """Build the ClaudeAgentOptions for the metadata agent."""
     # MCP tool names are prefixed with "mcp__<server-name>__".
-    # Trimmed from 20 → 13: dropped count_records, aggregation_retrieval,
-    # get_summary, flatten_records, and the two identify_nwb_contents_*
-    # (which pull in hdmf_zarr + boto3 — ~660ms of MCP startup). These
-    # are browse/NWB-inspection tools; the capture workflow never calls
-    # them. The get_*_example tools stay — system_prompt.py points the
-    # agent at them for schema reference. Saves ~1000 tokens of tool
-    # schemas per API turn.
+    # Trimmed from 20 → 16: dropped get_summary, flatten_records, and
+    # the two identify_nwb_contents_* (which pull in hdmf_zarr + boto3).
+    # count_records and aggregation_retrieval are kept because users need
+    # aggregate queries against the AIND MongoDB.
     aind_mcp_tools = [
         "mcp__aind-metadata-mcp__get_records",
+        "mcp__aind-metadata-mcp__count_records",
+        "mcp__aind-metadata-mcp__aggregation_retrieval",
         "mcp__aind-metadata-mcp__get_project_names",
         "mcp__aind-metadata-mcp__get_modality_types",
         "mcp__aind-metadata-mcp__get_subject_example",
@@ -74,6 +74,7 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
         "mcp__aind-metadata-mcp__get_quality_control_example",
         "mcp__aind-metadata-mcp__get_rig_example",
         "mcp__aind-metadata-mcp__get_top_level_nodes",
+        "mcp__aind-metadata-mcp__get_additional_schema_help",
     ]
 
     # Capture tools (capture_metadata, find_records, link_records, render_artifact)
@@ -106,17 +107,22 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     # fastmcp installed. Defaults to the system conda py311 env that was
     # already hosting the editable install.
     mcp_src = MCP_SERVER_DIR / "src"
+    print(f"[MCP] MCP_SERVER_DIR={MCP_SERVER_DIR}, src exists={mcp_src.is_dir()}, SKIP={os.environ.get('SKIP_AIND_MCP')}", flush=True)
     if mcp_src.is_dir() and os.environ.get("SKIP_AIND_MCP") != "1":
         mcp_python = os.environ.get(
             "AIND_MCP_PYTHON",
-            "/opt/homebrew/Caskroom/miniforge/base/envs/py311/bin/python3",
+            sys.executable,
         )
+        existing_pypath = os.environ.get("PYTHONPATH", "")
+        new_pypath = f"{mcp_src}:{existing_pypath}" if existing_pypath else str(mcp_src)
+        mcp_env = {**os.environ, "PYTHONPATH": new_pypath}
+        print(f"[MCP] Registering AIND MCP server via {mcp_python} (src={mcp_src})", flush=True)
         logger.info("Registering AIND MCP server via %s (src=%s)", mcp_python, mcp_src)
         mcp_servers["aind-metadata-mcp"] = {
             "type": "stdio",
             "command": mcp_python,
             "args": ["-m", "aind_metadata_mcp.data_access_server"],
-            "env": {"PYTHONPATH": str(mcp_src)},
+            "env": mcp_env,
         }
 
     # Built-in tools (Bash/Read/Glob/Grep/WebFetch/WebSearch) dropped — the
@@ -127,7 +133,7 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     opts = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         allowed_tools=["Read"] + capture_tools + aind_mcp_tools,
-        max_turns=5,
+        max_turns=15,
         model=model if model in AVAILABLE_MODELS else DEFAULT_MODEL,
         mcp_servers=mcp_servers,
         include_partial_messages=True,
@@ -432,14 +438,18 @@ async def _translate_to_sse(
                 yield {"block_stop": True}
 
         elif isinstance(message, AssistantMessage):
-            # Backfill text that didn't arrive via deltas (e.g.
-            # post-tool turns where streaming skipped a block).
-            msg_text = "".join(b.text for b in message.content if isinstance(b, TextBlock))
+            block_types = [type(b).__name__ for b in message.content]
+            msg_text = ""
+            for b in message.content:
+                if isinstance(b, TextBlock):
+                    msg_text += b.text
+                elif hasattr(b, 'text') and not isinstance(b, TextBlock):
+                    msg_text += b.text
             streamed_since = "".join(full_response[streamed_len_before_msg:])
             if msg_text and msg_text != streamed_since:
                 unstreamed = msg_text[len(streamed_since):] if msg_text.startswith(streamed_since) else msg_text
                 if unstreamed:
-                    logger.info("Yielding %d chars of unstreamed text", len(unstreamed))
+                    logger.info("Backfilling %d chars of unstreamed text from AssistantMessage", len(unstreamed))
                     full_response.append(unstreamed)
                     yield {"content": unstreamed}
             streamed_len_before_msg = len(full_response)
@@ -449,7 +459,36 @@ async def _translate_to_sse(
                 out_chars = sum(len(s) for s in full_response)
                 otps = (out_chars / 4) / (message.duration_ms / 1000) if message.duration_ms else 0
                 print(f"[profile] +{_t():.0f}ms: ResultMessage (turns={message.num_turns} sdk_duration={message.duration_ms}ms out={out_chars} chars ~{out_chars // 4} tok, OTPS~{otps:.1f} tok/s)", flush=True)
-            logger.info("Query complete: %d turns, %s ms", message.num_turns, message.duration_ms)
+            logger.info("Query complete: turns=%d, duration=%sms, is_error=%s, subtype=%s, result_len=%s",
+                        message.num_turns, message.duration_ms, message.is_error,
+                        message.subtype, len(message.result) if message.result else 0)
+
+            if message.is_error:
+                error_detail = message.result or "The agent encountered an internal error."
+                logger.error("SDK reported is_error=True: result=%r", error_detail[:500])
+                if not full_response:
+                    full_response.append(error_detail)
+                    yield {"content": error_detail}
+
+            elif message.result and not full_response:
+                logger.info("Using ResultMessage.result as response (%d chars)", len(message.result))
+                full_response.append(message.result)
+                yield {"content": message.result}
+            elif message.result and full_response:
+                streamed_text = "".join(full_response)
+                if message.result != streamed_text and len(message.result) > len(streamed_text):
+                    if message.result.startswith(streamed_text):
+                        extra = message.result[len(streamed_text):]
+                        if extra.strip():
+                            logger.info("Appending %d unstreamed trailing chars from ResultMessage.result", len(extra))
+                            full_response.append(extra)
+                            yield {"content": extra}
+            elif not message.result and not full_response:
+                logger.warning("Query produced no text: turns=%d, duration=%sms, is_error=%s, subtype=%s",
+                               message.num_turns, message.duration_ms, message.is_error, message.subtype)
+                fallback = "I completed processing but wasn't able to generate a response. Please try rephrasing your question."
+                full_response.append(fallback)
+                yield {"content": fallback}
 
 
 async def chat(
@@ -543,13 +582,12 @@ async def chat(
 
     full_response: list[str] = []
 
-    # Warm-pool fast path: skips the ~4s subprocess spawn on requests
-    # 2+. Falls back to query() if the pool is down or disabled.
     pool = get_pool()
-    use_pool = pool is not None and pool.is_warm and os.environ.get("USE_SDK_POOL", "1") == "1"
+    use_pool = pool is not None and pool.is_warm and os.environ.get("USE_SDK_POOL", "0") == "1"
+    path = "pool" if use_pool else "query()"
+    logger.info("Chat path=%s for session %s", path, session_id)
 
     if _PROFILE:
-        path = "pool" if use_pool else "query()"
         print(f"[profile] +{_t():.0f}ms: entering {path}", flush=True)
 
     if use_pool:
@@ -574,8 +612,16 @@ async def chat(
 
     # Save the assistant's complete response
     assistant_text = "".join(full_response)
+    logger.info("chat() post-stream: full_response has %d parts, %d chars total, session=%s",
+                len(full_response), len(assistant_text), session_id)
     if assistant_text.strip():
-        await save_conversation_turn(session_id, "assistant", assistant_text)
+        try:
+            await save_conversation_turn(session_id, "assistant", assistant_text)
+            logger.info("chat() saved assistant turn (%d chars) for session %s", len(assistant_text), session_id)
+        except Exception as save_exc:
+            logger.exception("chat() FAILED to save assistant turn for session %s: %s", session_id, save_exc)
+    else:
+        logger.warning("chat() skipping save: assistant_text is empty for session %s", session_id)
 
     yield {"done": True}
 
