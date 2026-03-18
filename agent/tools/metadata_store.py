@@ -372,6 +372,7 @@ async def save_upload(
     content_type: str,
     file_path: str,
     size_bytes: int,
+    file_data: bytes | None = None,
     session_id: str | None = None,
     initial_status: str = "pending",
 ) -> dict[str, Any]:
@@ -379,12 +380,14 @@ async def save_upload(
 
     initial_status: 'pending' for types that need background extraction,
     'done' for native types (images/PDFs) that are ready immediately.
+    file_data: raw file bytes stored in the DB so the file survives
+    ephemeral filesystems (e.g. autoscale production).
     """
     db = await get_db()
     await db.execute(
-        """INSERT INTO uploads (id, original_filename, content_type, file_path, size_bytes, session_id, extraction_status)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (upload_id, original_filename, content_type, file_path, size_bytes, session_id, initial_status),
+        """INSERT INTO uploads (id, original_filename, content_type, file_path, size_bytes, file_data, session_id, extraction_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (upload_id, original_filename, content_type, file_path, size_bytes, file_data, session_id, initial_status),
     )
     return {
         "id": upload_id,

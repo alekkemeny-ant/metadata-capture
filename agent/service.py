@@ -233,10 +233,18 @@ async def _build_multimodal_content(
 
         # --- Native types: send raw bytes to Claude ------------------------
         if content_type.startswith("image/") or content_type == "application/pdf":
-            if not file_path.exists():
+            if file_path.exists():
+                raw = file_path.read_bytes()
+            elif file_id:
+                upload = await get_upload(file_id)
+                if upload and upload.get("file_data"):
+                    raw = bytes(upload["file_data"])
+                else:
+                    logger.warning("Attachment file not found and no DB bytes: %s", file_path)
+                    continue
+            else:
                 logger.warning("Attachment file not found: %s", file_path)
                 continue
-            raw = file_path.read_bytes()
             b64_data = base64.standard_b64encode(raw).decode("ascii")
             if content_type.startswith("image/"):
                 content_blocks.append({
