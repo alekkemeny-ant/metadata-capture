@@ -88,13 +88,17 @@ class PostgresDatabase(Database):
             logger.info("PostgreSQL connection pool closed")
 
     async def init_tables(self) -> None:
-        from .models import PG_TABLES, CREATE_INDEXES
+        from .models import PG_TABLES, CREATE_INDEXES, UPLOADS_EXTRACTION_COLUMNS
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             for ddl in PG_TABLES:
                 await conn.execute(ddl)
             for idx in CREATE_INDEXES:
                 await conn.execute(idx)
+            for col_name, col_type in UPLOADS_EXTRACTION_COLUMNS:
+                await conn.execute(
+                    f"ALTER TABLE uploads ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                )
 
 
 class SQLiteDatabase(Database):
