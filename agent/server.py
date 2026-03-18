@@ -31,7 +31,7 @@ from .tools.spreadsheet import SPREADSHEET_CONTENT_TYPES, parse_spreadsheet
 logger = logging.getLogger(__name__)
 
 _is_deployment = os.environ.get("REPLIT_DEPLOYMENT") == "1"
-UPLOADS_DIR = Path("/tmp/uploads") if _is_deployment else Path(__file__).resolve().parent.parent / "uploads"
+UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", str(Path(__file__).resolve().parent.parent / "uploads")))
 
 # Extensions corresponding to NATIVE_TYPES — used as the extension fallback
 # for native files that arrive with a generic content-type like
