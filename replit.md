@@ -51,6 +51,13 @@ workspace/
 - METADATA_DB_DIR: optional override for SQLite database directory (defaults to agent/ package dir)
 
 ## Recent Changes
+- 2026-03-20: PyAV keyframe extraction — replaces per-frame ffmpeg subprocesses
+  - `av` (PyAV) added to requirements.txt; opens the video container ONCE and seeks N times
+  - `_extract_frames_sync` in `transcribe.py`: synchronous, runs in thread-pool executor; moov atom parsed once, H.264 decoder initialized once, one frame decoded per seek, PIL resize+PNG encode per frame
+  - `extract_keyframes_gen` calls `_extract_frames_sync` via `run_in_executor` then yields frames — peak RSS is one frame in memory at a time (same as before but without N×subprocess overhead and N×moov-parse)
+  - Removed per-frame ffmpeg subprocess spawning, temp file writes/reads, and the entire `tmpdir` tmpfile loop
+  - `thread_count=1, thread_type=FRAME` on the codec context — same single-thread constraint as the old `-threads 1` ffmpeg flag
+
 - 2026-03-20: Video keyframe storage refactor — fixes OOM crash on large videos
   - New `upload_keyframes` table: one row per frame (BYTEA), replacing the single huge `extracted_images_json` blob
   - `extract_keyframes_gen` async generator in `transcribe.py`: yields one PNG at a time, writes to disk, reads back, yields, deletes — only one frame in Python memory at any point
