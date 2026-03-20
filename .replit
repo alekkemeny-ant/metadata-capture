@@ -38,6 +38,10 @@ args = "cd /home/runner/workspace && USE_SDK_POOL=1 python -m agent.run & sleep 
 localPort = 5000
 externalPort = 80
 
+[[ports]]
+localPort = 5904
+externalPort = 3000
+
 [deployment]
 deploymentTarget = "autoscale"
 run = ["bash", "-c", "PYTHONUNBUFFERED=1 USE_SDK_POOL=1 python -m agent.run 2>&1 & sleep 5 && cd frontend && npm run start:replit"]

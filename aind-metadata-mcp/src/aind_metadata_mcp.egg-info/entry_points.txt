@@ -1,0 +1,2 @@
+[console_scripts]
+aind-metadata-mcp = aind_metadata_mcp.data_access_server:main

@@ -1,0 +1,15 @@
+aind-data-access-api
+fastmcp
+hdmf-zarr>=0.11.1
+langchain-core>=0.3.60
+pydantic>=2.11.4
+suffix-trees>=0.3.0
+
+[dev]
+black
+coverage
+flake8
+interrogate
+isort
+Sphinx
+furo

@@ -38,7 +38,7 @@ workspace/
 - Next.js rewrites proxy all API calls from frontend to backend
 
 ## Dependencies
-- Python: `pip install -r agent/requirements.txt && pip install -e ./aind-metadata-mcp`
+- Python: `pip install -r agent/requirements.txt && pip install -e ./aind-data-mcp`
 - Node.js: `cd frontend && npm install`
 - Claude Code CLI: `npm install -g @anthropic-ai/claude-code` (required by claude-agent-sdk)
 
