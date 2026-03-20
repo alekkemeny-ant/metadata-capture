@@ -1,6 +1,5 @@
 """Tools for persisting and retrieving metadata records."""
 
-import base64
 import json
 import logging
 import uuid
@@ -414,27 +413,22 @@ async def set_upload_extraction(
 ) -> None:
     """Persist extraction results for an upload.
 
-    Image bytes are base64-encoded for JSON storage:
-    [{"data": <b64 str>, "caption": <str>}, ...].
+    Images are stored one row per image in the upload_keyframes table.
     """
     db = await get_db()
-    images_json = json.dumps([
-        {"data": base64.b64encode(b).decode("ascii"), "caption": cap}
-        for b, cap in images
-    ])
     meta_json = json.dumps(meta)
     status = "error" if error else "done"
-    # Database.execute() auto-commits on the SQLite backend and asyncpg
-    # doesn't need explicit commit outside transactions — no .commit() here.
+    # Store each image as a separate row in upload_keyframes.
+    for frame_idx, (frame_bytes, caption) in enumerate(images):
+        await save_keyframe(upload_id, frame_idx, frame_bytes, caption)
     await db.execute(
         """UPDATE uploads
            SET extracted_text = ?,
-               extracted_images_json = ?,
                extracted_meta_json = ?,
                extraction_status = ?,
                extraction_error = ?
            WHERE id = ?""",
-        (text, images_json, meta_json, status, error, upload_id),
+        (text, meta_json, status, error, upload_id),
     )
 
 
@@ -486,7 +480,7 @@ async def get_upload_status(upload_id: str) -> dict[str, Any] | None:
     """
     db = await get_db()
     row = await db.fetchrow(
-        """SELECT extraction_status, extracted_text, extracted_images_json,
+        """SELECT extraction_status, extracted_text,
                   extracted_meta_json, extraction_error
            FROM uploads WHERE id = ?""",
         (upload_id,),
@@ -499,13 +493,6 @@ async def get_upload_status(upload_id: str) -> dict[str, Any] | None:
         (upload_id,),
     )
     kf_count = int(kf_count_row["cnt"]) if kf_count_row else 0
-
-    # Fall back to counting items in the legacy JSON blob if no keyframe rows.
-    if kf_count == 0 and row["extracted_images_json"]:
-        try:
-            kf_count = len(json.loads(row["extracted_images_json"]))
-        except (json.JSONDecodeError, TypeError):
-            kf_count = 0
 
     meta: dict = {}
     raw_meta = row["extracted_meta_json"]
@@ -536,7 +523,7 @@ async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
     """
     db = await get_db()
     row = await db.fetchrow(
-        """SELECT extraction_status, extracted_text, extracted_images_json,
+        """SELECT extraction_status, extracted_text,
                   extracted_meta_json, extraction_error
            FROM uploads WHERE id = ?""",
         (upload_id,),
@@ -544,29 +531,11 @@ async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
     if row is None:
         return None
 
-    # Prefer the normalized keyframes table (new path — one row per frame, no
-    # giant BYTEA blob). Fall back to the legacy extracted_images_json column
-    # for uploads created before this schema change.
-    images: list[tuple[bytes, str]] = []
-    decode_error: str | None = None
     kf_rows = await db.fetch(
         "SELECT frame_data, caption FROM upload_keyframes WHERE upload_id = ? ORDER BY frame_idx",
         (upload_id,),
     )
-    if kf_rows:
-        images = [(bytes(r["frame_data"]), r["caption"]) for r in kf_rows]
-    else:
-        raw_images = row["extracted_images_json"]
-        if raw_images:
-            try:
-                for item in json.loads(raw_images):
-                    images.append(
-                        (base64.b64decode(item["data"]), item["caption"])
-                    )
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                logger.warning("Malformed extracted_images_json for upload %s", upload_id)
-                decode_error = f"stored image data unreadable: {exc}"
-                images = []
+    images: list[tuple[bytes, str]] = [(bytes(r["frame_data"]), r["caption"]) for r in kf_rows]
 
     meta: dict = {}
     raw_meta = row["extracted_meta_json"]
