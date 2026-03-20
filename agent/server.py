@@ -456,25 +456,40 @@ async def _extract_and_store(upload_id: str, path: Path, content_type: str) -> N
     """
     from .tools.extractors import extract
     from .tools.metadata_store import save_keyframe, set_upload_extraction
-    from .tools.transcribe import _probe_duration, extract_keyframes_gen
+    from .tools.transcribe import (
+        _KEYFRAME_MAX_FILE_BYTES, _probe_duration, extract_keyframes_gen,
+    )
 
     is_video = content_type.startswith("video/") or path.suffix.lower() in _VIDEO_EXTS
 
     async with _EXTRACTION_SEMAPHORE:
         try:
             if is_video:
+                file_size = path.stat().st_size
+                too_large = file_size > _KEYFRAME_MAX_FILE_BYTES
+
                 # Streaming keyframe path — no bulk bytes accumulation.
+                # Skipped for files > _KEYFRAME_MAX_FILE_BYTES to avoid OOM.
                 frame_idx = 0
                 err: str | None = None
-                try:
-                    async for frame_bytes, caption in extract_keyframes_gen(path):
-                        await save_keyframe(upload_id, frame_idx, frame_bytes, caption)
-                        frame_idx += 1
-                except Exception as kf_exc:
-                    err = f"Keyframe extraction failed: {kf_exc}"
-                    logger.exception("Keyframe extraction error for %s", upload_id)
+                if not too_large:
+                    try:
+                        async for frame_bytes, caption in extract_keyframes_gen(path):
+                            await save_keyframe(upload_id, frame_idx, frame_bytes, caption)
+                            frame_idx += 1
+                    except Exception as kf_exc:
+                        err = f"Keyframe extraction failed: {kf_exc}"
+                        logger.exception("Keyframe extraction error for %s", upload_id)
 
                 duration = await _probe_duration(path)
+                extra: dict = {}
+                if too_large:
+                    extra["keyframes_skipped"] = True
+                    extra["keyframes_skip_reason"] = (
+                        f"File too large for keyframe extraction "
+                        f"({file_size // (1024*1024)}MB > "
+                        f"{_KEYFRAME_MAX_FILE_BYTES // (1024*1024)}MB limit)"
+                    )
                 await set_upload_extraction(
                     upload_id,
                     text="",
@@ -482,9 +497,10 @@ async def _extract_and_store(upload_id: str, path: Path, content_type: str) -> N
                     meta={
                         "keyframes": frame_idx,
                         "duration_sec": round(duration, 1),
-                        "transcript_pending": frame_idx > 0,
+                        "transcript_pending": True,
+                        **extra,
                     },
-                    error=err if frame_idx == 0 else None,
+                    error=err if frame_idx == 0 and not too_large else None,
                 )
             else:
                 result = await extract(path, content_type)

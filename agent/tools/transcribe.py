@@ -6,10 +6,14 @@ uploads/ directory via DB lookup (server.py), never raw user input.
 """
 
 import asyncio
+import logging
 import os
+import resource
 import shutil
 import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 MODEL_FILENAME = "ggml-base.en.bin"
@@ -25,6 +29,10 @@ _WHISPER_TIMEOUT_FLOOR_SEC = 120
 _KEYFRAME_MIN = 3
 _KEYFRAME_MAX = 20
 _KEYFRAME_SEC_PER_FRAME = 180
+# Videos larger than this skip keyframe extraction entirely (still transcribed
+# if whisper is available). At ~1GB the per-frame ffmpeg RSS can push the
+# container past its cgroup memory limit and cause a SIGKILL.
+_KEYFRAME_MAX_FILE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
 
 
 class TranscriptionUnavailable(RuntimeError):
@@ -59,6 +67,18 @@ def check_availability() -> dict:
     return {"available": len(missing) == 0, "missing": missing}
 
 
+def _rss_mb() -> int:
+    """Return the current process RSS in MB (Linux /proc/self/status)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+
+
 async def _run(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
     """Spawn argv, wait with timeout.
 
@@ -77,6 +97,27 @@ async def _run(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
         await proc.wait()
         raise
     return proc.returncode or 0, stdout, stderr
+
+
+async def _run_silent(argv: list[str], timeout: float) -> int:
+    """Spawn argv with stdout/stderr discarded. Returns the exit code only.
+
+    Used for ffmpeg keyframe extraction where we only care whether the output
+    file was written, not what ffmpeg printed. Discarding the pipes means no
+    stderr data is buffered in Python at all.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode or 0
 
 
 def _scaled_timeout(duration_sec: float, factor: float, floor: float) -> float:
@@ -191,12 +232,16 @@ async def _probe_duration(src: Path) -> float:
     argv = [
         ffprobe,
         "-v", "error",
+        # Limit how much data ffprobe reads for stream analysis.
+        # For MP4 with moov at end ffprobe still seeks, but caps buffering.
+        "-analyzeduration", "1000000",   # 1 second of stream analysis max
+        "-probesize", "5000000",          # 5 MB read budget
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(src),
     ]
     try:
-        rc, stdout, _ = await _run(argv, timeout=30)
+        rc, stdout, _ = await _run(argv, timeout=60)
         if rc != 0:
             return 0.0
         return float(stdout.decode(errors="replace").strip())
@@ -213,10 +258,27 @@ async def extract_keyframes_gen(
     Writes each frame to a temp file, reads it, yields it, then deletes it
     immediately. Only one frame worth of bytes is in memory at any point.
     Use this for large videos to avoid accumulating all frames in RAM.
+
+    Videos larger than _KEYFRAME_MAX_FILE_BYTES are skipped entirely — no
+    frames yielded — to avoid the per-frame ffmpeg RSS pushing the container
+    past its cgroup memory limit (which causes a silent SIGKILL).
     """
     ffmpeg = find_binary("ffmpeg")
     if ffmpeg is None:
         raise TranscriptionUnavailable("ffmpeg not found on PATH")
+
+    file_size = src.stat().st_size
+    logger.info("[keyframes] start src=%s size_mb=%d rss_mb=%d",
+                src.name, file_size // (1024 * 1024), _rss_mb())
+
+    if file_size > _KEYFRAME_MAX_FILE_BYTES:
+        logger.warning(
+            "[keyframes] skipping — file too large for keyframe extraction "
+            "(size=%dMB limit=%dMB). Transcript will still run if available.",
+            file_size // (1024 * 1024),
+            _KEYFRAME_MAX_FILE_BYTES // (1024 * 1024),
+        )
+        return
 
     duration = await _probe_duration(src)
 
@@ -236,22 +298,32 @@ async def extract_keyframes_gen(
             step = upper / (count - 1)
             timestamps = [min(upper, max(0.0, i * step)) for i in range(count)]
 
+    logger.info("[keyframes] duration=%.1fs frames=%d", duration, len(timestamps))
+
     tmpdir = Path(tempfile.mkdtemp())
     try:
         for i, ts in enumerate(timestamps):
             out_png = tmpdir / f"frame_{i}.png"
             argv = [
                 ffmpeg, "-y",
+                "-threads", "1",        # single decode thread — halves RSS vs default
                 "-ss", f"{ts:.2f}",
                 "-i", str(src),
                 "-frames:v", "1",
                 "-vf", "scale=1024:-1",
                 str(out_png),
             ]
+            rss_before = _rss_mb()
             try:
-                rc, _, _ = await _run(argv, timeout=30)
-            except Exception:
+                rc = await _run_silent(argv, timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("[keyframes] frame %d timed out (ts=%.1f)", i, ts)
                 continue
+            except Exception as exc:
+                logger.warning("[keyframes] frame %d error: %s", i, exc)
+                continue
+            logger.info("[keyframes] frame %d ts=%.1f rc=%d rss_before=%dMB rss_after=%dMB",
+                        i, ts, rc, rss_before, _rss_mb())
             if rc != 0 or not out_png.exists():
                 continue
             if out_png.stat().st_size > 5_000_000:
@@ -262,6 +334,7 @@ async def extract_keyframes_gen(
             yield (data, f"Frame at {ts:.1f}s")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        logger.info("[keyframes] done rss_mb=%d", _rss_mb())
 
 
 async def extract_keyframes(src: Path, count: int | None = None) -> list[tuple[bytes, str]]:
