@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     original_filename TEXT NOT NULL,
     content_type TEXT NOT NULL,
     file_path TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,  -- SQLite INTEGER is 64-bit, fine for large files
     file_data BLOB,
     session_id TEXT,
     extracted_text TEXT,
@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     original_filename TEXT NOT NULL,
     content_type TEXT NOT NULL,
     file_path TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
+    size_bytes BIGINT NOT NULL,
     file_data BYTEA,
     session_id TEXT,
     extracted_text TEXT,

@@ -9,6 +9,8 @@ channel = "stable-25_05"
 
 [userenv.shared]
 NEXT_PUBLIC_API_URL = ""
+
+[userenv.production]
 UPLOADS_DIR = "/tmp/uploads"
 
 [workflows]
