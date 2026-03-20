@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     content_type TEXT NOT NULL,
     file_path TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
+    file_data BLOB,
     session_id TEXT,
     extracted_text TEXT,
     extracted_images_json TEXT,
@@ -64,11 +65,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """,
-]
-
-# Artifacts — agent-generated spreadsheets/tables/code shown in ArtifactModal.
-# Appended as the 5th entry in both SQLITE_TABLES and PG_TABLES below.
-SQLITE_TABLES.append("""
+    """
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -79,18 +76,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     language TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-""")
-
-# Extraction columns — already inline in the SQLITE_TABLES uploads DDL above,
-# but kept here for migrating pre-existing DBs that were created before the
-# multimodal extraction feature. SQLiteDatabase.init_tables() runs a PRAGMA
-# check + ALTER TABLE for each.
-UPLOADS_EXTRACTION_COLUMNS: list[tuple[str, str]] = [
-    ("extracted_text", "TEXT"),
-    ("extracted_images_json", "TEXT"),
-    ("extracted_meta_json", "TEXT"),
-    ("extraction_status", "TEXT DEFAULT 'pending'"),
-    ("extraction_error", "TEXT"),
+""",
 ]
 
 # ---------------------------------------------------------------------------
@@ -138,8 +124,6 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at TEXT NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')::TEXT
 );
 """,
-    # uploads — extraction columns mirror SQLITE_TABLES so multimodal features
-    # (PR #6) work identically on the Replit production PostgreSQL backend.
     """
 CREATE TABLE IF NOT EXISTS uploads (
     id TEXT PRIMARY KEY,
@@ -147,6 +131,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     content_type TEXT NOT NULL,
     file_path TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
+    file_data BYTEA,
     session_id TEXT,
     extracted_text TEXT,
     extracted_images_json TEXT,

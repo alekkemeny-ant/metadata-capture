@@ -19,7 +19,7 @@ os.environ.setdefault("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from .db.database import close_db, init_db
@@ -30,7 +30,8 @@ from .tools.spreadsheet import SPREADSHEET_CONTENT_TYPES, parse_spreadsheet
 
 logger = logging.getLogger(__name__)
 
-UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
+_is_deployment = os.environ.get("REPLIT_DEPLOYMENT") == "1"
+UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", str(Path(__file__).resolve().parent.parent / "uploads")))
 
 # Extensions corresponding to NATIVE_TYPES — used as the extension fallback
 # for native files that arrive with a generic content-type like
@@ -75,11 +76,11 @@ async def lifespan(app: FastAPI):
         pool = init_pool(_get_options)
         print("[lifespan] Warming SDK client pool...", flush=True)
         try:
-            await asyncio.wait_for(pool.warmup(), timeout=30)
+            await asyncio.wait_for(pool.warmup(), timeout=60)
             print("[lifespan] SDK client pool warm", flush=True)
         except asyncio.TimeoutError:
             logger.warning(
-                "SDK client pool warmup timed out after 30s — chat() will fall back to "
+                "SDK client pool warmup timed out after 60s — chat() will fall back to "
                 "per-request query() (~4s slower)."
             )
             print("[lifespan] SDK client pool warmup timed out", flush=True)
@@ -509,8 +510,12 @@ async def upload_file(file: UploadFile, session_id: str | None = None):
     file_id = str(uuid.uuid4())
     dest_ext = ext or ".bin"
     dest = UPLOADS_DIR / f"{file_id}{dest_ext}"
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(contents)
+    try:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(contents)
+    except OSError as e:
+        logger.exception("Failed to write upload to %s", dest)
+        raise HTTPException(status_code=500, detail=f"File storage error: {e}")
 
     # Native types (images, PDFs) go directly to Claude at chat time — no
     # extraction pipeline. Mark them 'done' at insert so the frontend's
@@ -523,6 +528,7 @@ async def upload_file(file: UploadFile, session_id: str | None = None):
         content_type=content_type,
         file_path=str(dest),
         size_bytes=len(contents),
+        file_data=contents,
         session_id=session_id,
         initial_status="done" if is_native else "pending",
     )
@@ -569,14 +575,21 @@ async def get_uploaded_file(file_id: str):
         raise HTTPException(status_code=404, detail="Upload not found")
 
     file_path = Path(upload["file_path"])
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found on disk")
+    if file_path.exists():
+        return FileResponse(
+            path=str(file_path),
+            media_type=upload["content_type"],
+            filename=upload["original_filename"],
+        )
 
-    return FileResponse(
-        path=str(file_path),
-        media_type=upload["content_type"],
-        filename=upload["original_filename"],
-    )
+    if upload.get("file_data"):
+        return Response(
+            content=bytes(upload["file_data"]),
+            media_type=upload["content_type"],
+            headers={"Content-Disposition": f'inline; filename="{upload["original_filename"]}"'},
+        )
+
+    raise HTTPException(status_code=404, detail="File not found")
 
 
 @app.get("/uploads/{file_id}/table")
@@ -594,7 +607,12 @@ async def get_upload_as_table(file_id: str) -> dict[str, Any]:
 
     file_path = Path(upload["file_path"])
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found on disk")
+        if upload.get("file_data"):
+            UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(bytes(upload["file_data"]))
+        else:
+            raise HTTPException(status_code=404, detail="File not found")
 
     try:
         parsed = parse_spreadsheet(file_path, content_type)

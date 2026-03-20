@@ -87,6 +87,19 @@ workspace/
   - Health check state lifted to page.tsx, passed as prop to Header and ChatPanel
   - Chat input disabled with "Agent is starting up..." overlay when agent offline
   - Deployment set to autoscale (cold start ~60s)
+- 2026-03-18: Upload durability & schema cleanup
+  - Uploads table now stores raw file bytes (`file_data` BYTEA/BLOB) in the database
+  - File-serve endpoints fall back to DB bytes when disk file is missing (fixes autoscale 404s)
+  - `_prepare_attachments` in service.py also falls back to DB for native types (images/PDFs)
+  - `UPLOADS_DIR` is now an env var (default: `workspace/uploads/`, Replit: `/tmp/uploads`)
+  - Removed all migration/drift-detection logic from `database.py` — `init_tables` just runs DDL
+  - Removed `UPLOADS_EXTRACTION_COLUMNS` from models.py — no duplicated column lists
+- 2026-03-17: Production MCP fixes
+  - Build command now installs Python deps (`pip install -r agent/requirements.txt && pip install -e ./aind-metadata-mcp`) before frontend build — ensures aind-metadata-mcp is available in production container
+  - SDK pool warmup timeout increased from 30s → 60s (MCP startup takes ~33s in production due to MongoDB connection latency)
+  - 529 Overloaded errors now show user-friendly message instead of raw SDK error string
+  - Fallback model list in `api.ts` updated to match backend (claude-sonnet-4-6)
+  - Restored `NEXT_PUBLIC_API_URL` default to `http://localhost:8001` for local dev SSE streaming (Replit overrides to `""` via `[userenv.shared]`)
 - 2026-02-24: Configured for Replit environment
   - Set Next.js to port 5000 with all hosts allowed
   - Set backend to localhost:8001

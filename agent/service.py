@@ -132,7 +132,7 @@ def _build_options(model: str | None = None) -> ClaudeAgentOptions:
     # uploaded files on disk if base64 isn't enough (rare edge case).
     opts = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
-        allowed_tools=["Read"] + capture_tools + aind_mcp_tools,
+        allowed_tools=["Read", "WebSearch"] + capture_tools + aind_mcp_tools,
         max_turns=15,
         model=model if model in AVAILABLE_MODELS else DEFAULT_MODEL,
         mcp_servers=mcp_servers,
@@ -233,10 +233,18 @@ async def _build_multimodal_content(
 
         # --- Native types: send raw bytes to Claude ------------------------
         if content_type.startswith("image/") or content_type == "application/pdf":
-            if not file_path.exists():
+            if file_path.exists():
+                raw = file_path.read_bytes()
+            elif file_id:
+                upload = await get_upload(file_id)
+                if upload and upload.get("file_data"):
+                    raw = bytes(upload["file_data"])
+                else:
+                    logger.warning("Attachment file not found and no DB bytes: %s", file_path)
+                    continue
+            else:
                 logger.warning("Attachment file not found: %s", file_path)
                 continue
-            raw = file_path.read_bytes()
             b64_data = base64.standard_b64encode(raw).decode("ascii")
             if content_type.startswith("image/"):
                 content_blocks.append({
@@ -467,8 +475,12 @@ async def _translate_to_sse(
                 error_detail = message.result or "The agent encountered an internal error."
                 logger.error("SDK reported is_error=True: result=%r", error_detail[:500])
                 if not full_response:
-                    full_response.append(error_detail)
-                    yield {"content": error_detail}
+                    if "529" in error_detail or "verload" in error_detail:
+                        user_msg = "Claude's API is currently overloaded. Please wait a moment and try again."
+                    else:
+                        user_msg = error_detail
+                    full_response.append(user_msg)
+                    yield {"content": user_msg}
 
             elif message.result and not full_response:
                 logger.info("Using ResultMessage.result as response (%d chars)", len(message.result))
