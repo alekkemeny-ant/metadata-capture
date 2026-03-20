@@ -95,27 +95,6 @@ async def _run(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
     return proc.returncode or 0, stdout, stderr
 
 
-async def _run_silent(argv: list[str], timeout: float) -> int:
-    """Spawn argv with stdout/stderr discarded. Returns the exit code only.
-
-    Used for ffmpeg keyframe extraction where we only care whether the output
-    file was written, not what ffmpeg printed. Discarding the pipes means no
-    stderr data is buffered in Python at all.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise
-    return proc.returncode or 0
-
-
 def _scaled_timeout(duration_sec: float, factor: float, floor: float) -> float:
     return max(floor, duration_sec * factor)
 
@@ -362,63 +341,3 @@ async def extract_keyframes_gen(
     logger.info("[keyframes] done extracted=%d rss_mb=%d", len(frames), _rss_mb())
     for frame_bytes, caption in frames:
         yield frame_bytes, caption
-
-
-async def extract_keyframes(src: Path, count: int | None = None) -> list[tuple[bytes, str]]:
-    """Pull evenly-spaced PNG frames from a video.
-
-    count=None auto-scales with duration (~1 frame per 3min, bounded 3..20).
-    Timestamps are clamped to [0, duration - 0.1]. Uses -ss before -i for
-    fast seeking — per-frame cost is constant regardless of file size.
-    Frames are scaled to 1024px wide (aspect preserved).
-
-    Returns [(png_bytes, "Frame at {ts}s"), ...].
-    """
-    ffmpeg = find_binary("ffmpeg")
-    if ffmpeg is None:
-        raise TranscriptionUnavailable("ffmpeg not found on PATH")
-
-    duration = await _probe_duration(src)
-
-    if count is None:
-        if duration > 0:
-            count = max(_KEYFRAME_MIN, min(_KEYFRAME_MAX, int(duration // _KEYFRAME_SEC_PER_FRAME)))
-        else:
-            count = _KEYFRAME_MIN
-
-    if duration <= 0:
-        # No usable duration — just grab the first frame.
-        timestamps = [0.0]
-    else:
-        upper = max(0.0, duration - 0.1)
-        if count <= 1:
-            timestamps = [upper / 2]
-        else:
-            step = upper / (count - 1)
-            timestamps = [min(upper, max(0.0, i * step)) for i in range(count)]
-
-    frames: list[tuple[bytes, str]] = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for i, ts in enumerate(timestamps):
-            out_png = Path(tmpdir) / f"frame_{i}.png"
-            argv = [
-                ffmpeg, "-y",
-                "-ss", f"{ts:.2f}",
-                "-i", str(src),
-                "-frames:v", "1",
-                "-vf", "scale=1024:-1",
-                str(out_png),
-            ]
-            try:
-                rc, _, _ = await _run(argv, timeout=30)
-            except Exception:
-                continue
-            if rc != 0 or not out_png.exists():
-                continue
-            # scale=1024:-1 should keep frames under ~500KB, but skip pathological
-            # outliers so a single frame can't balloon the extraction payload.
-            if out_png.stat().st_size > 5_000_000:
-                continue
-            frames.append((out_png.read_bytes(), f"Frame at {ts:.1f}s"))
-
-    return frames
