@@ -29,10 +29,6 @@ _WHISPER_TIMEOUT_FLOOR_SEC = 120
 _KEYFRAME_MIN = 3
 _KEYFRAME_MAX = 20
 _KEYFRAME_SEC_PER_FRAME = 180
-# Videos larger than this skip keyframe extraction entirely (still transcribed
-# if whisper is available). At ~1GB the per-frame ffmpeg RSS can push the
-# container past its cgroup memory limit and cause a SIGKILL.
-_KEYFRAME_MAX_FILE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
 
 
 class TranscriptionUnavailable(RuntimeError):
@@ -330,12 +326,8 @@ async def extract_keyframes_gen(
 
     Uses PyAV to open the video file ONCE and seek to each target timestamp,
     so the container index (moov atom) is parsed only once regardless of how
-    many frames are requested. This is significantly more memory-efficient than
-    spawning one ffmpeg process per frame.
-
-    Videos larger than _KEYFRAME_MAX_FILE_BYTES still skip extraction — the
-    per-frame decode buffers (even with 1 thread) can exceed the container's
-    cgroup memory limit for very large inputs.
+    many frames are requested. Peak RSS is one frame's decode buffers (single
+    thread), independent of file size or frame count.
 
     The actual extraction runs in a thread-pool executor so it doesn't block
     the asyncio event loop during H.264 decoding.
@@ -343,15 +335,6 @@ async def extract_keyframes_gen(
     file_size = src.stat().st_size
     logger.info("[keyframes] start src=%s size_mb=%d rss_mb=%d",
                 src.name, file_size // (1024 * 1024), _rss_mb())
-
-    if file_size > _KEYFRAME_MAX_FILE_BYTES:
-        logger.warning(
-            "[keyframes] skipping — file too large "
-            "(size=%dMB > limit=%dMB). Transcript will still run if available.",
-            file_size // (1024 * 1024),
-            _KEYFRAME_MAX_FILE_BYTES // (1024 * 1024),
-        )
-        return
 
     duration = await _probe_duration(src)
 
