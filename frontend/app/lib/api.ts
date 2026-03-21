@@ -84,12 +84,28 @@ export async function fetchModels(): Promise<ModelInfo> {
   }
 }
 
+// Files larger than this are split into CHUNK_SIZE pieces to stay under the
+// reverse-proxy body limit (~32 MB on Replit's GCP load balancer).
+const CHUNK_THRESHOLD = 8 * 1024 * 1024;  // 8 MB
+const CHUNK_SIZE      = 5 * 1024 * 1024;  // 5 MB per chunk — comfortably under the cap
+
 /**
- * XHR instead of fetch — fetch() has no upload progress API. For a 2.38GB
- * video over real network this is the difference between a progress bar
- * and a minute of dead silence.
+ * Upload a file. Small files (≤ 8 MB) go via a single XHR for progress
+ * reporting. Large files are split into 5 MB chunks that each pass under
+ * the reverse-proxy body-size limit, then reassembled server-side.
  */
 export async function uploadFile(
+  file: File,
+  sessionId?: string,
+  onProgress?: (fraction: number) => void,
+): Promise<UploadedFile> {
+  if (file.size > CHUNK_THRESHOLD) {
+    return _uploadChunked(file, sessionId, onProgress);
+  }
+  return _uploadSingle(file, sessionId, onProgress);
+}
+
+function _uploadSingle(
   file: File,
   sessionId?: string,
   onProgress?: (fraction: number) => void,
@@ -119,6 +135,55 @@ export async function uploadFile(
     xhr.onerror = () => reject(new Error('Upload failed: network error'));
     xhr.send(formData);
   });
+}
+
+async function _uploadChunked(
+  file: File,
+  sessionId?: string,
+  onProgress?: (fraction: number) => void,
+): Promise<UploadedFile> {
+  // 1. Initialize the upload session
+  const initParams = new URLSearchParams({
+    filename: file.name,
+    content_type: file.type || 'application/octet-stream',
+    ...(sessionId ? { session_id: sessionId } : {}),
+  });
+  const initRes = await fetch(`${API_BASE}/upload/init?${initParams}`, { method: 'POST' });
+  if (!initRes.ok) {
+    throw new Error(`Upload init failed (${initRes.status}): ${await initRes.text()}`);
+  }
+  const { upload_id } = await initRes.json() as { upload_id: string };
+
+  // 2. Upload each chunk sequentially
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end   = Math.min(start + CHUNK_SIZE, file.size);
+    const blob  = file.slice(start, end);
+
+    const form = new FormData();
+    form.append('file', blob, file.name);
+
+    const chunkRes = await fetch(
+      `${API_BASE}/upload/chunk?upload_id=${encodeURIComponent(upload_id)}&chunk_index=${i}`,
+      { method: 'POST', body: form },
+    );
+    if (!chunkRes.ok) {
+      throw new Error(`Chunk ${i + 1}/${totalChunks} failed (${chunkRes.status}): ${await chunkRes.text()}`);
+    }
+
+    onProgress?.((i + 1) / totalChunks);
+  }
+
+  // 3. Finalize — backend assembles chunks and starts extraction
+  const finalRes = await fetch(
+    `${API_BASE}/upload/finalize?upload_id=${encodeURIComponent(upload_id)}&total_chunks=${totalChunks}`,
+    { method: 'POST' },
+  );
+  if (!finalRes.ok) {
+    throw new Error(`Upload finalize failed (${finalRes.status}): ${await finalRes.text()}`);
+  }
+  return finalRes.json() as Promise<UploadedFile>;
 }
 
 export function getUploadUrl(fileId: string): string {

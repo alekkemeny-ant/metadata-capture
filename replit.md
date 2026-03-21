@@ -51,6 +51,19 @@ workspace/
 - METADATA_DB_DIR: optional override for SQLite database directory (defaults to agent/ package dir)
 
 ## Recent Changes
+- 2026-03-21: Chunked file upload — bypasses Replit reverse-proxy 413 limit
+  - Files > 8 MB are automatically split into 5 MB chunks by the frontend and reassembled server-side
+  - Three new backend endpoints: `POST /upload/init`, `POST /upload/chunk`, `POST /upload/finalize`
+  - Small files (≤ 8 MB) still use the original single-XHR path for progress reporting
+  - `CHUNKS_DIR = UPLOADS_DIR / "chunks"` stores temp chunk files during assembly; cleaned up after finalize
+  - Next.js rewrites and `.replitignore` updated accordingly
+
+- 2026-03-21: Fixed deployment bundle size — added `.replitignore`
+  - `uploads/` (12 GB local videos) excluded from the deployment bundle
+  - `.pythonlibs/`, `frontend/node_modules/` remain in bundle (needed at runtime in Replit autoscale)
+  - `.cache/`, `.local/`, `.config/`, `__pycache__/`, `*.pyc`, `*.db` also excluded
+
+
 - 2026-03-20: PyAV keyframe extraction — replaces per-frame ffmpeg subprocesses
   - `av` (PyAV) added to requirements.txt; opens the video container ONCE and seeks N times
   - `_extract_frames_sync` in `transcribe.py`: synchronous, runs in thread-pool executor; moov atom parsed once, H.264 decoder initialized once, one frame decoded per seek, PIL resize+PNG encode per frame

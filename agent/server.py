@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 _is_deployment = os.environ.get("REPLIT_DEPLOYMENT") == "1"
 UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", str(Path(__file__).resolve().parent.parent / "uploads")))
+CHUNKS_DIR = UPLOADS_DIR / "chunks"
 
 # Extensions corresponding to NATIVE_TYPES — used as the extension fallback
 # for native files that arrive with a generic content-type like
@@ -641,6 +643,150 @@ async def upload_file(file: UploadFile, session_id: str | None = None):
         # Video: transcript runs as a second, slower task. Keyframes (above)
         # finish in ~20s and flip status to 'done'; transcript lands minutes
         # later and merges into the row via append_upload_transcript.
+        if is_video:
+            from .tools.transcribe import check_availability
+            if check_availability()["available"]:
+                asyncio.create_task(_transcribe_and_append(file_id, dest))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Chunked upload — breaks large files into small pieces to avoid the
+# reverse-proxy body-size limit (Replit's GCP load balancer caps at ~32 MB).
+# Flow: POST /upload/init → POST /upload/chunk (×N) → POST /upload/finalize
+# ---------------------------------------------------------------------------
+
+_CHUNK_MAX_BYTES = 8 * 1024 * 1024  # 8 MB — safe under any reasonable proxy cap
+
+
+@app.post("/upload/init")
+async def upload_init_chunked(filename: str, content_type: str, session_id: str | None = None):
+    """Start a chunked upload session. Returns an upload_id for subsequent chunk POSTs."""
+    upload_id = str(uuid.uuid4())
+    chunk_dir = CHUNKS_DIR / upload_id
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    meta = {"filename": filename, "content_type": content_type, "session_id": session_id}
+    (chunk_dir / "_meta.json").write_text(json.dumps(meta))
+    return {"upload_id": upload_id}
+
+
+@app.post("/upload/chunk")
+async def upload_chunk(file: UploadFile, upload_id: str, chunk_index: int):
+    """Receive one chunk. The chunk body must be ≤ _CHUNK_MAX_BYTES."""
+    chunk_dir = CHUNKS_DIR / upload_id
+    if not chunk_dir.exists():
+        raise HTTPException(status_code=404, detail="Upload session not found — call /upload/init first")
+    data = await file.read(_CHUNK_MAX_BYTES + 1)
+    if len(data) > _CHUNK_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"Chunk exceeds {_CHUNK_MAX_BYTES // (1024 * 1024)} MB limit")
+    chunk_path = chunk_dir / f"chunk_{chunk_index:06d}"
+    chunk_path.write_bytes(data)
+    return {"ok": True, "chunk_index": chunk_index, "size": len(data)}
+
+
+@app.post("/upload/finalize")
+async def upload_finalize_chunked(upload_id: str, total_chunks: int):
+    """Assemble all chunks into the final file and run the same pipeline as /upload."""
+    from .tools.metadata_store import save_upload
+
+    chunk_dir = CHUNKS_DIR / upload_id
+    if not chunk_dir.exists():
+        raise HTTPException(status_code=404, detail="Upload session not found")
+
+    try:
+        meta = json.loads((chunk_dir / "_meta.json").read_text())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Upload metadata missing or corrupt")
+
+    filename = meta["filename"]
+    content_type = meta.get("content_type", "")
+    session_id = meta.get("session_id")
+    ext = Path(filename).suffix.lower()
+
+    if content_type not in ALLOWED_CONTENT_TYPES and ext not in ALLOWED_EXTENSIONS:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {content_type or '(none)'} / {ext or '(no ext)'}",
+        )
+
+    is_video = content_type.startswith("video/") or ext in _VIDEO_EXTS
+    is_audio = content_type.startswith("audio/") or ext in (_AV_EXTS - _VIDEO_EXTS)
+
+    if is_video or is_audio:
+        from .tools.transcribe import check_availability, find_binary
+        if is_video:
+            if find_binary("ffmpeg") is None:
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+                raise HTTPException(status_code=503, detail="Video processing unavailable: ffmpeg not found")
+        else:
+            avail = check_availability()
+            if not avail["available"]:
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Transcription unavailable: missing {', '.join(avail['missing'])}",
+                )
+
+    chunk_paths = sorted(chunk_dir.glob("chunk_*"))
+    if len(chunk_paths) != total_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {total_chunks} chunks, found {len(chunk_paths)} — some may be missing",
+        )
+
+    file_id = str(uuid.uuid4())
+    dest_ext = ext or ".bin"
+    dest = UPLOADS_DIR / f"{file_id}{dest_ext}"
+    size_cap = MAX_VIDEO_UPLOAD_SIZE if is_video else MAX_UPLOAD_SIZE
+    size_bytes = 0
+
+    try:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as out:
+            for cp in chunk_paths:
+                data = cp.read_bytes()
+                size_bytes += len(data)
+                if size_bytes > size_cap:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum is {size_cap // (1024 * 1024)} MB.",
+                    )
+                out.write(data)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        raise
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Assembly failed: {exc}")
+
+    shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    file_data: bytes | None = None
+    if size_bytes <= MAX_UPLOAD_SIZE:
+        try:
+            file_data = dest.read_bytes()
+        except OSError:
+            logger.warning("Could not re-read assembled upload for DB durability: %s", dest)
+
+    is_native = content_type in NATIVE_TYPES or ext in _NATIVE_EXTS
+
+    result = await save_upload(
+        upload_id=file_id,
+        original_filename=filename,
+        content_type=content_type,
+        file_path=str(dest),
+        size_bytes=size_bytes,
+        file_data=file_data,
+        session_id=session_id,
+        initial_status="done" if is_native else "pending",
+    )
+
+    if not is_native:
+        asyncio.create_task(_extract_and_store(file_id, dest, content_type))
         if is_video:
             from .tools.transcribe import check_availability
             if check_availability()["available"]:
