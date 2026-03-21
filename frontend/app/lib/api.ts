@@ -154,8 +154,10 @@ async function _uploadChunked(
   }
   const { upload_id } = await initRes.json() as { upload_id: string };
 
-  // 2. Upload each chunk sequentially
+  // 2. Upload each chunk sequentially with retry on 429
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  const _sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
   for (let i = 0; i < totalChunks; i++) {
     const start = i * CHUNK_SIZE;
     const end   = Math.min(start + CHUNK_SIZE, file.size);
@@ -164,15 +166,31 @@ async function _uploadChunked(
     const form = new FormData();
     form.append('file', blob, file.name);
 
-    const chunkRes = await fetch(
-      `${API_BASE}/upload/chunk?upload_id=${encodeURIComponent(upload_id)}&chunk_index=${i}`,
-      { method: 'POST', body: form },
-    );
-    if (!chunkRes.ok) {
+    const url = `${API_BASE}/upload/chunk?upload_id=${encodeURIComponent(upload_id)}&chunk_index=${i}`;
+
+    let attempt = 0;
+    const maxAttempts = 6;
+    while (true) {
+      const chunkRes = await fetch(url, { method: 'POST', body: form });
+      if (chunkRes.ok) break;
+
+      if (chunkRes.status === 429 && attempt < maxAttempts) {
+        attempt++;
+        const retryAfter = chunkRes.headers.get('Retry-After');
+        const delay = retryAfter
+          ? parseInt(retryAfter, 10) * 1000
+          : Math.min(500 * 2 ** attempt, 30_000);
+        await _sleep(delay);
+        continue;
+      }
+
       throw new Error(`Chunk ${i + 1}/${totalChunks} failed (${chunkRes.status}): ${await chunkRes.text()}`);
     }
 
     onProgress?.((i + 1) / totalChunks);
+    // Brief pause between chunks — keeps request rate well under proxy limits
+    // without meaningfully affecting overall throughput for large files.
+    await _sleep(100);
   }
 
   // 3. Finalize — backend assembles chunks and starts extraction
