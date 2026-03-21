@@ -38,7 +38,7 @@ workspace/
 - Next.js rewrites proxy all API calls from frontend to backend
 
 ## Dependencies
-- Python: `pip install -r agent/requirements.txt && pip install -e ./aind-metadata-mcp`
+- Python: `pip install -r agent/requirements.txt && pip install -e ./aind-data-mcp`
 - Node.js: `cd frontend && npm install`
 - Claude Code CLI: `npm install -g @anthropic-ai/claude-code` (required by claude-agent-sdk)
 
@@ -51,6 +51,36 @@ workspace/
 - METADATA_DB_DIR: optional override for SQLite database directory (defaults to agent/ package dir)
 
 ## Recent Changes
+- 2026-03-21: Chunked file upload — bypasses Replit reverse-proxy 413 limit
+  - Files > 8 MB are automatically split into 5 MB chunks by the frontend and reassembled server-side
+  - Three new backend endpoints: `POST /upload/init`, `POST /upload/chunk`, `POST /upload/finalize`
+  - Small files (≤ 8 MB) still use the original single-XHR path for progress reporting
+  - `CHUNKS_DIR = UPLOADS_DIR / "chunks"` stores temp chunk files during assembly; cleaned up after finalize
+  - Next.js rewrites and `.replitignore` updated accordingly
+
+- 2026-03-21: Fixed deployment bundle size — added `.replitignore`
+  - `uploads/` (12 GB local videos) excluded from the deployment bundle
+  - `.pythonlibs/`, `frontend/node_modules/` remain in bundle (needed at runtime in Replit autoscale)
+  - `.cache/`, `.local/`, `.config/`, `__pycache__/`, `*.pyc`, `*.db` also excluded
+
+
+- 2026-03-20: PyAV keyframe extraction — replaces per-frame ffmpeg subprocesses
+  - `av` (PyAV) added to requirements.txt; opens the video container ONCE and seeks N times
+  - `_extract_frames_sync` in `transcribe.py`: synchronous, runs in thread-pool executor; moov atom parsed once, H.264 decoder initialized once, one frame decoded per seek, PIL resize+PNG encode per frame
+  - `extract_keyframes_gen` calls `_extract_frames_sync` via `run_in_executor` then yields frames — peak RSS is one frame in memory at a time (same as before but without N×subprocess overhead and N×moov-parse)
+  - Removed per-frame ffmpeg subprocess spawning, temp file writes/reads, and the entire `tmpdir` tmpfile loop
+  - `thread_count=1, thread_type=FRAME` on the codec context — same single-thread constraint as the old `-threads 1` ffmpeg flag
+
+- 2026-03-20: Video keyframe storage refactor — fixes OOM crash on large videos
+  - New `upload_keyframes` table: one row per frame (BYTEA), replacing the single huge `extracted_images_json` blob
+  - `extract_keyframes_gen` async generator in `transcribe.py`: yields one PNG at a time, writes to disk, reads back, yields, deletes — only one frame in Python memory at any point
+  - `_extract_and_store` in `server.py` now has a dedicated video path: consumes the generator and calls `save_keyframe()` per frame before moving to the next
+  - Extraction status poll (`/uploads/{id}/extraction`) uses `COUNT(*)` on `upload_keyframes` for image count — no image bytes loaded just to count frames
+  - `get_upload_extraction` loads from `upload_keyframes` first; falls back to old `extracted_images_json` for backward compat with uploads created before this change
+  - `extract_video` in `extractors.py` is now a stub (kept so MIME types stay in the allowed set; actual extraction happens in `server.py`)
+  - Fixed `size_bytes` column: `INTEGER` → `BIGINT` in PostgreSQL DDL (max was 2.1GB, videos can be larger)
+  - `UPLOADS_DIR` moved from shared env var to production-only; dev now defaults to `workspace/uploads/` (253GB) instead of `/tmp/uploads` (2GB Replit quota)
+
 - 2026-03-04: Dual database backend (PostgreSQL + SQLite)
   - `agent/db/database.py`: `Database` ABC with `PostgresDatabase` and `SQLiteDatabase` implementations
   - Auto-selects backend: `DATABASE_URL` set → PostgreSQL (asyncpg pool), unset → SQLite (aiosqlite)

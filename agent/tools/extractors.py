@@ -202,36 +202,16 @@ async def extract_audio(path: Path, content_type: str) -> ExtractedContent:
     exts=(".mp4", ".mov", ".webm", ".mkv"),
 )
 async def extract_video(path: Path, content_type: str) -> ExtractedContent:
-    """Keyframes only — the fast path for video.
+    """Stub — video extraction is handled by the streaming keyframe path in
+    server._extract_and_store, which writes one frame at a time to the
+    upload_keyframes table to avoid accumulating all PNG bytes in memory.
 
-    Frame count auto-scales with duration (3..20, ~1/3min). Transcription
-    runs as a separate background task (server.py schedules it) that
-    appends to the extraction row later; this function returning 'done'
-    means the user can hit send, not that transcription is finished.
+    This registered extractor exists so the MIME types stay in the allowed
+    set (server.py checks EXTRACTORS/EXT_EXTRACTORS to validate uploads).
+    It should never be called directly for actual extraction.
     """
-    from . import transcribe as T  # lazy
-
-    try:
-        frames = await T.extract_keyframes(path, count=None)
-    except Exception as e:
-        return ExtractedContent(
-            text="", error=f"Keyframe extraction failed: {e}",
-            meta={"keyframes": 0, "transcript_pending": False},
-        )
-
-    if not frames:
-        return ExtractedContent(
-            text="", error="Keyframe extraction produced no frames",
-            meta={"keyframes": 0, "transcript_pending": False},
-        )
-
-    duration = await T._probe_duration(path)
     return ExtractedContent(
         text="",
-        images=frames,
-        meta={
-            "keyframes": len(frames),
-            "duration_sec": round(duration, 1),
-            "transcript_pending": True,
-        },
+        meta={"keyframes": 0, "transcript_pending": False},
+        error="extract_video called directly — use the streaming keyframe path in server.py",
     )

@@ -54,11 +54,10 @@ CREATE TABLE IF NOT EXISTS uploads (
     original_filename TEXT NOT NULL,
     content_type TEXT NOT NULL,
     file_path TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,  -- SQLite INTEGER is 64-bit, fine for large files
     file_data BLOB,
     session_id TEXT,
     extracted_text TEXT,
-    extracted_images_json TEXT,
     extracted_meta_json TEXT,
     extraction_status TEXT DEFAULT 'pending',
     extraction_error TEXT,
@@ -74,6 +73,16 @@ CREATE TABLE IF NOT EXISTS artifacts (
     title TEXT NOT NULL,
     content_json TEXT NOT NULL,
     language TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS upload_keyframes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    upload_id TEXT NOT NULL,
+    frame_idx INTEGER NOT NULL,
+    frame_data BLOB NOT NULL,
+    caption TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """,
@@ -130,11 +139,10 @@ CREATE TABLE IF NOT EXISTS uploads (
     original_filename TEXT NOT NULL,
     content_type TEXT NOT NULL,
     file_path TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
+    size_bytes BIGINT NOT NULL,
     file_data BYTEA,
     session_id TEXT,
     extracted_text TEXT,
-    extracted_images_json TEXT,
     extracted_meta_json TEXT,
     extraction_status TEXT DEFAULT 'pending',
     extraction_error TEXT,
@@ -150,6 +158,16 @@ CREATE TABLE IF NOT EXISTS artifacts (
     title TEXT NOT NULL,
     content_json TEXT NOT NULL,
     language TEXT,
+    created_at TEXT NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')::TEXT
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS upload_keyframes (
+    id SERIAL PRIMARY KEY,
+    upload_id TEXT NOT NULL,
+    frame_idx INTEGER NOT NULL,
+    frame_data BYTEA NOT NULL,
+    caption TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')::TEXT
 );
 """,
@@ -169,6 +187,7 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_uploads_session ON uploads(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_keyframes_upload ON upload_keyframes(upload_id)",
 ]
 
 # ---------------------------------------------------------------------------

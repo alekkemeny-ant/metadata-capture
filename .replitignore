@@ -1,0 +1,11 @@
+uploads/
+.cache/
+.local/
+.config/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-shm
+*.db-wal
+agent/metadata.db

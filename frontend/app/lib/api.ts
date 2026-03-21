@@ -84,12 +84,28 @@ export async function fetchModels(): Promise<ModelInfo> {
   }
 }
 
+// Files larger than this are split into CHUNK_SIZE pieces to stay under the
+// reverse-proxy body limit (~32 MB on Replit's GCP load balancer).
+const CHUNK_THRESHOLD = 8 * 1024 * 1024;  // 8 MB
+const CHUNK_SIZE      = 5 * 1024 * 1024;  // 5 MB per chunk — comfortably under the cap
+
 /**
- * XHR instead of fetch — fetch() has no upload progress API. For a 2.38GB
- * video over real network this is the difference between a progress bar
- * and a minute of dead silence.
+ * Upload a file. Small files (≤ 8 MB) go via a single XHR for progress
+ * reporting. Large files are split into 5 MB chunks that each pass under
+ * the reverse-proxy body-size limit, then reassembled server-side.
  */
 export async function uploadFile(
+  file: File,
+  sessionId?: string,
+  onProgress?: (fraction: number) => void,
+): Promise<UploadedFile> {
+  if (file.size > CHUNK_THRESHOLD) {
+    return _uploadChunked(file, sessionId, onProgress);
+  }
+  return _uploadSingle(file, sessionId, onProgress);
+}
+
+function _uploadSingle(
   file: File,
   sessionId?: string,
   onProgress?: (fraction: number) => void,
@@ -119,6 +135,73 @@ export async function uploadFile(
     xhr.onerror = () => reject(new Error('Upload failed: network error'));
     xhr.send(formData);
   });
+}
+
+async function _uploadChunked(
+  file: File,
+  sessionId?: string,
+  onProgress?: (fraction: number) => void,
+): Promise<UploadedFile> {
+  // 1. Initialize the upload session
+  const initParams = new URLSearchParams({
+    filename: file.name,
+    content_type: file.type || 'application/octet-stream',
+    ...(sessionId ? { session_id: sessionId } : {}),
+  });
+  const initRes = await fetch(`${API_BASE}/upload/init?${initParams}`, { method: 'POST' });
+  if (!initRes.ok) {
+    throw new Error(`Upload init failed (${initRes.status}): ${await initRes.text()}`);
+  }
+  const { upload_id } = await initRes.json() as { upload_id: string };
+
+  // 2. Upload each chunk sequentially with retry on 429
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  const _sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end   = Math.min(start + CHUNK_SIZE, file.size);
+    const blob  = file.slice(start, end);
+
+    const form = new FormData();
+    form.append('file', blob, file.name);
+
+    const url = `${API_BASE}/upload/chunk?upload_id=${encodeURIComponent(upload_id)}&chunk_index=${i}`;
+
+    let attempt = 0;
+    const maxAttempts = 6;
+    while (true) {
+      const chunkRes = await fetch(url, { method: 'POST', body: form });
+      if (chunkRes.ok) break;
+
+      if (chunkRes.status === 429 && attempt < maxAttempts) {
+        attempt++;
+        const retryAfter = chunkRes.headers.get('Retry-After');
+        const delay = retryAfter
+          ? parseInt(retryAfter, 10) * 1000
+          : Math.min(500 * 2 ** attempt, 30_000);
+        await _sleep(delay);
+        continue;
+      }
+
+      throw new Error(`Chunk ${i + 1}/${totalChunks} failed (${chunkRes.status}): ${await chunkRes.text()}`);
+    }
+
+    onProgress?.((i + 1) / totalChunks);
+    // Brief pause between chunks — keeps request rate well under proxy limits
+    // without meaningfully affecting overall throughput for large files.
+    await _sleep(100);
+  }
+
+  // 3. Finalize — backend assembles chunks and starts extraction
+  const finalRes = await fetch(
+    `${API_BASE}/upload/finalize?upload_id=${encodeURIComponent(upload_id)}&total_chunks=${totalChunks}`,
+    { method: 'POST' },
+  );
+  if (!finalRes.ok) {
+    throw new Error(`Upload finalize failed (${finalRes.status}): ${await finalRes.text()}`);
+  }
+  return finalRes.json() as Promise<UploadedFile>;
 }
 
 export function getUploadUrl(fileId: string): string {
@@ -337,11 +420,11 @@ export async function fetchRecord(recordId: string): Promise<MetadataRecord> {
   return res.json();
 }
 
-export async function updateRecordData(recordId: string, data: Record<string, unknown>): Promise<MetadataRecord> {
+export async function updateRecordData(recordId: string, data: Record<string, unknown>, merge = true): Promise<MetadataRecord> {
   const res = await fetch(`${API_BASE}/records/${recordId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ data }),
+    body: JSON.stringify({ data, merge }),
   });
   if (!res.ok) throw new Error(`Failed to update record: ${res.status}`);
   return res.json();

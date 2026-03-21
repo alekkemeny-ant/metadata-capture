@@ -1,6 +1,5 @@
 """Tools for persisting and retrieving metadata records."""
 
-import base64
 import json
 import logging
 import uuid
@@ -414,27 +413,22 @@ async def set_upload_extraction(
 ) -> None:
     """Persist extraction results for an upload.
 
-    Image bytes are base64-encoded for JSON storage:
-    [{"data": <b64 str>, "caption": <str>}, ...].
+    Images are stored one row per image in the upload_keyframes table.
     """
     db = await get_db()
-    images_json = json.dumps([
-        {"data": base64.b64encode(b).decode("ascii"), "caption": cap}
-        for b, cap in images
-    ])
     meta_json = json.dumps(meta)
     status = "error" if error else "done"
-    # Database.execute() auto-commits on the SQLite backend and asyncpg
-    # doesn't need explicit commit outside transactions — no .commit() here.
+    # Store each image as a separate row in upload_keyframes.
+    for frame_idx, (frame_bytes, caption) in enumerate(images):
+        await save_keyframe(upload_id, frame_idx, frame_bytes, caption)
     await db.execute(
         """UPDATE uploads
            SET extracted_text = ?,
-               extracted_images_json = ?,
                extracted_meta_json = ?,
                extraction_status = ?,
                extraction_error = ?
            WHERE id = ?""",
-        (text, images_json, meta_json, status, error, upload_id),
+        (text, meta_json, status, error, upload_id),
     )
 
 
@@ -477,16 +471,16 @@ async def append_upload_transcript(
     )
 
 
-async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
-    """Fetch extraction results for an upload.
+async def get_upload_status(upload_id: str) -> dict[str, Any] | None:
+    """Lightweight status check — no image bytes loaded.
 
-    Returns {"status", "text", "images", "meta", "error"} with images
-    decoded back to [(bytes, caption), ...], or None if the upload
-    doesn't exist.
+    Returns {"status", "text", "meta", "error", "image_count"} using
+    COUNT(*) on upload_keyframes instead of fetching BYTEA blobs.
+    Used by the extraction poll endpoint which only needs a count, not bytes.
     """
     db = await get_db()
     row = await db.fetchrow(
-        """SELECT extraction_status, extracted_text, extracted_images_json,
+        """SELECT extraction_status, extracted_text,
                   extracted_meta_json, extraction_error
            FROM uploads WHERE id = ?""",
         (upload_id,),
@@ -494,20 +488,54 @@ async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
     if row is None:
         return None
 
-    images: list[tuple[bytes, str]] = []
-    decode_error: str | None = None
-    raw_images = row["extracted_images_json"]
-    if raw_images:
-        try:
-            for item in json.loads(raw_images):
-                images.append(
-                    (base64.b64decode(item["data"]), item["caption"])
-                )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            logger.warning("Malformed extracted_images_json for upload %s", upload_id)
-            # Surface corruption to caller — don't silently pretend no images existed.
-            decode_error = f"stored image data unreadable: {exc}"
-            images = []
+    kf_count_row = await db.fetchrow(
+        "SELECT COUNT(*) AS cnt FROM upload_keyframes WHERE upload_id = ?",
+        (upload_id,),
+    )
+    kf_count = int(kf_count_row["cnt"]) if kf_count_row else 0
+
+    meta: dict = {}
+    raw_meta = row["extracted_meta_json"]
+    if raw_meta:
+        parsed = _parse_json(raw_meta)
+        if isinstance(parsed, dict):
+            meta = parsed
+
+    return {
+        "status": row["extraction_status"],
+        "text": row["extracted_text"],
+        "meta": meta,
+        "error": row["extraction_error"],
+        "image_count": kf_count,
+    }
+
+
+async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
+    """Fetch extraction results for an upload, including image bytes.
+
+    Returns {"status", "text", "images", "meta", "error"} with images
+    decoded back to [(bytes, caption), ...], or None if the upload
+    doesn't exist.
+
+    NOTE: This loads all keyframe bytes into memory. Only call when the
+    bytes are actually needed (e.g. _prepare_attachments in service.py).
+    For status polls use get_upload_status instead.
+    """
+    db = await get_db()
+    row = await db.fetchrow(
+        """SELECT extraction_status, extracted_text,
+                  extracted_meta_json, extraction_error
+           FROM uploads WHERE id = ?""",
+        (upload_id,),
+    )
+    if row is None:
+        return None
+
+    kf_rows = await db.fetch(
+        "SELECT frame_data, caption FROM upload_keyframes WHERE upload_id = ? ORDER BY frame_idx",
+        (upload_id,),
+    )
+    images: list[tuple[bytes, str]] = [(bytes(r["frame_data"]), r["caption"]) for r in kf_rows]
 
     meta: dict = {}
     raw_meta = row["extracted_meta_json"]
@@ -522,8 +550,47 @@ async def get_upload_extraction(upload_id: str) -> dict[str, Any] | None:
         "text": row["extracted_text"],
         "images": images,
         "meta": meta,
-        "error": decode_error or stored_error,
+        "error": stored_error,
     }
+
+
+# ---------------------------------------------------------------------------
+# Keyframe storage (upload_keyframes table)
+# ---------------------------------------------------------------------------
+
+async def save_keyframe(
+    upload_id: str,
+    frame_idx: int,
+    frame_data: bytes,
+    caption: str,
+) -> None:
+    """Persist a single video keyframe as a DB row."""
+    db = await get_db()
+    await db.execute(
+        """INSERT INTO upload_keyframes (upload_id, frame_idx, frame_data, caption)
+           VALUES (?, ?, ?, ?)""",
+        (upload_id, frame_idx, frame_data, caption),
+    )
+
+
+async def count_keyframes(upload_id: str) -> int:
+    """Return the number of keyframes stored for an upload."""
+    db = await get_db()
+    row = await db.fetchrow(
+        "SELECT COUNT(*) AS cnt FROM upload_keyframes WHERE upload_id = ?",
+        (upload_id,),
+    )
+    return int(row["cnt"]) if row else 0
+
+
+async def get_keyframes(upload_id: str) -> list[tuple[bytes, str]]:
+    """Fetch all keyframes for an upload as [(png_bytes, caption), ...]."""
+    db = await get_db()
+    rows = await db.fetch(
+        "SELECT frame_data, caption FROM upload_keyframes WHERE upload_id = ? ORDER BY frame_idx",
+        (upload_id,),
+    )
+    return [(bytes(row["frame_data"]), row["caption"]) for row in rows]
 
 
 # ---------------------------------------------------------------------------

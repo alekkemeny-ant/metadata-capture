@@ -62,7 +62,7 @@ class PostgresDatabase(Database):
         if self._pool is None:
             import asyncpg
             database_url = os.environ["DATABASE_URL"]
-            self._pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
+            self._pool = await asyncpg.create_pool(database_url, min_size=1, max_size=10)
             logger.info("PostgreSQL connection pool created")
         return self._pool
 

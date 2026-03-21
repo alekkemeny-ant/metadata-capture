@@ -29,6 +29,7 @@ def main():
             "*.pyc",
             "evals/*",
             ".pythonlibs/*",
+            "uploads/*",
         ] if is_dev else None,
     )
 

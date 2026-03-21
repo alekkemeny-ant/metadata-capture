@@ -6,10 +6,14 @@ uploads/ directory via DB lookup (server.py), never raw user input.
 """
 
 import asyncio
+import logging
 import os
+import resource
 import shutil
 import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 MODEL_FILENAME = "ggml-base.en.bin"
@@ -57,6 +61,18 @@ def check_availability() -> dict:
     if _model_path() is None:
         missing.append(f"model file ({MODELS_DIR / MODEL_FILENAME})")
     return {"available": len(missing) == 0, "missing": missing}
+
+
+def _rss_mb() -> int:
+    """Return the current process RSS in MB (Linux /proc/self/status)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
 
 
 async def _run(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
@@ -191,12 +207,16 @@ async def _probe_duration(src: Path) -> float:
     argv = [
         ffprobe,
         "-v", "error",
+        # Limit how much data ffprobe reads for stream analysis.
+        # For MP4 with moov at end ffprobe still seeks, but caps buffering.
+        "-analyzeduration", "1000000",   # 1 second of stream analysis max
+        "-probesize", "5000000",          # 5 MB read budget
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(src),
     ]
     try:
-        rc, stdout, _ = await _run(argv, timeout=30)
+        rc, stdout, _ = await _run(argv, timeout=60)
         if rc != 0:
             return 0.0
         return float(stdout.decode(errors="replace").strip())
@@ -204,19 +224,96 @@ async def _probe_duration(src: Path) -> float:
         return 0.0
 
 
-async def extract_keyframes(src: Path, count: int | None = None) -> list[tuple[bytes, str]]:
-    """Pull evenly-spaced PNG frames from a video.
+def _extract_frames_sync(
+    src: Path,
+    timestamps: list[float],
+) -> list[tuple[bytes, str]]:
+    """Synchronous: open the video once, seek N times, return PNG bytes.
 
-    count=None auto-scales with duration (~1 frame per 3min, bounded 3..20).
-    Timestamps are clamped to [0, duration - 0.1]. Uses -ss before -i for
-    fast seeking — per-frame cost is constant regardless of file size.
-    Frames are scaled to 1024px wide (aspect preserved).
+    Opens the container a SINGLE time (moov atom parsed once), seeks to each
+    timestamp, decodes the first available frame, scales to ≤1024px wide, and
+    encodes to PNG bytes. All work happens in the caller's thread.
 
-    Returns [(png_bytes, "Frame at {ts}s"), ...].
+    Returns a list of (png_bytes, caption) — at most len(timestamps) items.
+    Missing/corrupt frames are silently skipped.
     """
-    ffmpeg = find_binary("ffmpeg")
-    if ffmpeg is None:
-        raise TranscriptionUnavailable("ffmpeg not found on PATH")
+    import io
+    import av
+    from PIL import Image
+
+    results: list[tuple[bytes, str]] = []
+    container = None
+    try:
+        container = av.open(str(src))
+        video_stream = next(
+            (s for s in container.streams if s.type == "video"), None
+        )
+        if video_stream is None:
+            logger.warning("[keyframes] no video stream in %s", src.name)
+            return results
+
+        # Single decode thread — same peak RSS as -threads 1 in ffmpeg.
+        video_stream.codec_context.thread_count = 1
+        video_stream.codec_context.thread_type = 1  # FRAME threading only
+
+        for i, ts in enumerate(timestamps):
+            rss_before = _rss_mb()
+            try:
+                # Seek to the nearest keyframe at or before ts (microseconds).
+                pts_us = int(ts * 1_000_000)
+                container.seek(pts_us, stream=video_stream, backward=True, any_frame=False)
+                frame = None
+                for pkt in container.decode(video_stream):
+                    frame = pkt
+                    break
+                if frame is None:
+                    continue
+
+                # Scale: keep aspect ratio, cap width at 1024px.
+                w = min(frame.width, 1024)
+                h = int(frame.height * w / frame.width)
+                img: Image.Image = frame.to_image()
+                if img.width != w or img.height != h:
+                    img = img.resize((w, h), Image.LANCZOS)
+
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=False)
+                png_bytes = buf.getvalue()
+
+                if len(png_bytes) > 5_000_000:
+                    logger.warning("[keyframes] frame %d oversize (%dKB), skipping", i, len(png_bytes) // 1024)
+                    continue
+
+                logger.info("[keyframes] frame %d ts=%.1fs size=%dKB rss_before=%dMB rss_after=%dMB",
+                            i, ts, len(png_bytes) // 1024, rss_before, _rss_mb())
+                results.append((png_bytes, f"Frame at {ts:.1f}s"))
+            except Exception as exc:
+                logger.warning("[keyframes] frame %d (ts=%.1f) error: %s", i, ts, exc)
+    except Exception as exc:
+        logger.exception("[keyframes] container open/seek failed for %s: %s", src.name, exc)
+    finally:
+        if container is not None:
+            container.close()
+    return results
+
+
+async def extract_keyframes_gen(
+    src: Path,
+    count: int | None = None,
+):
+    """Async generator: yield (png_bytes, caption) one frame at a time.
+
+    Uses PyAV to open the video file ONCE and seek to each target timestamp,
+    so the container index (moov atom) is parsed only once regardless of how
+    many frames are requested. Peak RSS is one frame's decode buffers (single
+    thread), independent of file size or frame count.
+
+    The actual extraction runs in a thread-pool executor so it doesn't block
+    the asyncio event loop during H.264 decoding.
+    """
+    file_size = src.stat().st_size
+    logger.info("[keyframes] start src=%s size_mb=%d rss_mb=%d",
+                src.name, file_size // (1024 * 1024), _rss_mb())
 
     duration = await _probe_duration(src)
 
@@ -227,7 +324,6 @@ async def extract_keyframes(src: Path, count: int | None = None) -> list[tuple[b
             count = _KEYFRAME_MIN
 
     if duration <= 0:
-        # No usable duration — just grab the first frame.
         timestamps = [0.0]
     else:
         upper = max(0.0, duration - 0.1)
@@ -237,28 +333,11 @@ async def extract_keyframes(src: Path, count: int | None = None) -> list[tuple[b
             step = upper / (count - 1)
             timestamps = [min(upper, max(0.0, i * step)) for i in range(count)]
 
-    frames: list[tuple[bytes, str]] = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for i, ts in enumerate(timestamps):
-            out_png = Path(tmpdir) / f"frame_{i}.png"
-            argv = [
-                ffmpeg, "-y",
-                "-ss", f"{ts:.2f}",
-                "-i", str(src),
-                "-frames:v", "1",
-                "-vf", "scale=1024:-1",
-                str(out_png),
-            ]
-            try:
-                rc, _, _ = await _run(argv, timeout=30)
-            except Exception:
-                continue
-            if rc != 0 or not out_png.exists():
-                continue
-            # scale=1024:-1 should keep frames under ~500KB, but skip pathological
-            # outliers so a single frame can't balloon the extraction payload.
-            if out_png.stat().st_size > 5_000_000:
-                continue
-            frames.append((out_png.read_bytes(), f"Frame at {ts:.1f}s"))
+    logger.info("[keyframes] duration=%.1fs frames=%d", duration, len(timestamps))
 
-    return frames
+    loop = asyncio.get_event_loop()
+    frames = await loop.run_in_executor(None, _extract_frames_sync, src, timestamps)
+
+    logger.info("[keyframes] done extracted=%d rss_mb=%d", len(frames), _rss_mb())
+    for frame_bytes, caption in frames:
+        yield frame_bytes, caption

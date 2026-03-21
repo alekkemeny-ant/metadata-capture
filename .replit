@@ -4,11 +4,14 @@ expertMode = true
 
 [nix]
 channel = "stable-25_05"
+packages = ["ffmpeg-full", "pkg-config"]
 
 [userenv]
 
 [userenv.shared]
 NEXT_PUBLIC_API_URL = ""
+
+[userenv.production]
 UPLOADS_DIR = "/tmp/uploads"
 
 [workflows]
@@ -37,6 +40,10 @@ args = "cd /home/runner/workspace && USE_SDK_POOL=1 python -m agent.run & sleep 
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[[ports]]
+localPort = 5904
+externalPort = 3000
 
 [deployment]
 deploymentTarget = "autoscale"

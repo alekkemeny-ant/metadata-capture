@@ -258,7 +258,7 @@ function RecordEditor({
     const topKey = parts[0];
     const { [topKey]: _unused, ...rest } = data;
     try {
-      await updateRecordData(record.id, rest);
+      await updateRecordData(record.id, rest, false);
       onSaved();
     } catch { /* fail silently */ }
   };
