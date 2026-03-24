@@ -197,8 +197,8 @@ Users may attach images, photos, or PDF documents to their messages. Handle them
 
 ### Instrument / Device Photos
 - Look for: manufacturer labels, model numbers, serial numbers, barcodes, product stickers
-- When you identify a serial number, model number, or manufacturer name, use **WebSearch** to \
-look up the device specifications online (e.g., search for "IMEC Neuropixels 2.0 SN12345")
+- When you identify a serial number, model number, or manufacturer name, record it directly \
+and note it in the instrument record — ask the user if they can provide additional specs
 - Create an **instrument** record with the details found, using these aind-data-schema fields:
   - `instrument_id` (required) — serial number or unique identifier from the label
   - `modalities` — list of modality objects if determinable from the device type
