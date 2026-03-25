@@ -132,7 +132,7 @@ workspace/
   - `connect_failed` flag distinguishes "failed to connect" (60s retry) from "normal reconnect" (5s)
   - Shutdown via `None` sentinel still works; `cancel()` interrupts any sleep cleanly
   - MCP-unavailability detection: `chat()` checks response text for "aind-data-mcp" / "MCP server" + "reconnect" / "not available"; if found, clears `_ready` to force immediate pool reconnect so the next query works
-  - MCP watchdog: background task pings `api.allenneuraldynamics.org/v2` every 2 min; if API is healthy and pool connection is older than 5 min, forces proactive reconnect to refresh MCP subprocess
+  - MCP watchdog: background task runs a real MCP health check every 2 min — starts a fresh aind-data-mcp subprocess, connects via MCP protocol (stdio), calls `initialize` + `list_tools`, verifies tools are registered, then cleans up. If check fails, forces immediate reconnect. If healthy and pool age > 5 min, forces reconnect to refresh the pool's MCP subprocess
   - Pool `_run()` polls every 30s (down from 5 min idle timeout) so it picks up the watchdog's `_needs_reconnect` flag promptly
   - `start()` launches both the worker task and the watchdog task
 

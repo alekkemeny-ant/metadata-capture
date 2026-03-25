@@ -27,11 +27,12 @@ its own queue and forward drained events into out_queue with a marker.
 
 import asyncio
 import logging
+import os
+import sys
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
-from urllib.request import urlopen
-from urllib.error import URLError
 
 from claude_agent_sdk import ClaudeSDKClient
 from claude_agent_sdk.types import ResultMessage
@@ -70,7 +71,6 @@ class SDKClientPool:
 
     HEALTH_CHECK_INTERVAL_S = 120   # check every 2 min
     MAX_POOL_AGE_S = 300            # force reconnect after 5 min
-    AIND_API_URL = "https://api.allenneuraldynamics.org/v2"
 
     def __init__(self, options_factory):
         """options_factory(model) -> ClaudeAgentOptions (or cached)."""
@@ -172,37 +172,81 @@ class SDKClientPool:
                 raise item.exc
             yield item
 
-    @staticmethod
-    def _ping_aind_api(url: str, timeout: float = 10.0) -> bool:
-        """Synchronous HTTP check — run in executor to avoid blocking."""
+    async def _check_mcp_health(self) -> bool:
+        """Start a fresh aind-data-mcp subprocess and verify it registers tools.
+
+        Uses the MCP protocol (JSON-RPC over stdio) to connect, initialize,
+        and list tools. Returns True if the server starts and exposes at
+        least one tool, False otherwise. The subprocess is always killed
+        after the check.
+        """
+        from mcp import StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        from mcp import ClientSession
+
+        mcp_server_dir = Path(os.environ.get(
+            "MCP_SERVER_DIR",
+            str(Path(__file__).resolve().parent.parent / "aind-data-mcp"),
+        ))
+        mcp_src = mcp_server_dir / "src"
+        if not mcp_src.is_dir():
+            logger.warning("MCP health check: src dir not found at %s", mcp_src)
+            return False
+
+        mcp_python = os.environ.get("AIND_MCP_PYTHON", sys.executable)
+        existing_pypath = os.environ.get("PYTHONPATH", "")
+        new_pypath = f"{mcp_src}:{existing_pypath}" if existing_pypath else str(mcp_src)
+        mcp_env = {**os.environ, "PYTHONPATH": new_pypath, "PYTHONUNBUFFERED": "1"}
+
+        server_params = StdioServerParameters(
+            command=mcp_python,
+            args=["-m", "aind_data_mcp.data_access_server"],
+            env=mcp_env,
+        )
+
         try:
-            with urlopen(url, timeout=timeout) as resp:
-                return resp.status == 200
-        except (URLError, OSError, TimeoutError):
+            async with stdio_client(server_params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await asyncio.wait_for(session.initialize(), timeout=30.0)
+                    result = await asyncio.wait_for(session.list_tools(), timeout=10.0)
+                    tool_count = len(result.tools) if result.tools else 0
+                    tool_names = [t.name for t in result.tools] if result.tools else []
+                    logger.info(
+                        "MCP health check: %d tools registered: %s",
+                        tool_count, tool_names,
+                    )
+                    return tool_count > 0
+        except asyncio.TimeoutError:
+            logger.warning("MCP health check: timed out connecting to aind-data-mcp")
+            return False
+        except Exception:
+            logger.exception("MCP health check: failed to connect to aind-data-mcp")
             return False
 
     async def _watchdog(self):
-        """Background task: periodically health-check the AIND API and
-        force a pool reconnect when the connection is stale.
+        """Background task: periodically verify the local MCP server is
+        healthy and force a pool reconnect when it's stale.
 
         Every HEALTH_CHECK_INTERVAL_S:
-        1. Ping api.allenneuraldynamics.org — if unreachable, log a
-           warning (reconnecting won't help if the API is down).
-        2. If reachable AND the pool connection is older than
-           MAX_POOL_AGE_S, set _needs_reconnect so _run() picks it up
-           on the next 30s poll cycle.
+        1. Start a fresh aind-data-mcp subprocess and check it registers
+           tools via MCP protocol — this verifies the server code, its
+           Python deps, and any external connections (MongoDB) all work.
+        2. If healthy AND pool connection is older than MAX_POOL_AGE_S,
+           set _needs_reconnect so _run() picks it up on the next poll.
+        3. If unhealthy, force immediate reconnect (the pool's MCP
+           subprocess may have died).
         """
-        loop = asyncio.get_running_loop()
         while True:
             try:
                 await asyncio.sleep(self.HEALTH_CHECK_INTERVAL_S)
 
-                healthy = await loop.run_in_executor(
-                    None, self._ping_aind_api, self.AIND_API_URL
-                )
+                healthy = await self._check_mcp_health()
 
                 if not healthy:
-                    logger.warning("MCP watchdog: AIND API unreachable (%s)", self.AIND_API_URL)
+                    logger.warning(
+                        "MCP watchdog: aind-data-mcp health check FAILED — forcing reconnect"
+                    )
+                    self._needs_reconnect = True
                     continue
 
                 if not self.is_warm:
@@ -212,12 +256,12 @@ class SDKClientPool:
                 age = time.monotonic() - self._connect_monotonic
                 if age > self.MAX_POOL_AGE_S:
                     logger.info(
-                        "MCP watchdog: pool age %.0fs > %ds and AIND API healthy — requesting reconnect",
+                        "MCP watchdog: pool age %.0fs > %ds and MCP healthy — requesting reconnect",
                         age, self.MAX_POOL_AGE_S,
                     )
                     self._needs_reconnect = True
                 else:
-                    logger.debug("MCP watchdog: pool age %.0fs OK, AIND API healthy", age)
+                    logger.debug("MCP watchdog: pool age %.0fs OK, MCP healthy", age)
 
             except asyncio.CancelledError:
                 raise
