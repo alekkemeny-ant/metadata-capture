@@ -30,6 +30,8 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any
+from urllib.request import urlopen
+from urllib.error import URLError
 
 from claude_agent_sdk import ClaudeSDKClient
 from claude_agent_sdk.types import ResultMessage
@@ -66,23 +68,31 @@ class SDKClientPool:
     multi-worker, this becomes one pool per worker (process-local).
     """
 
+    HEALTH_CHECK_INTERVAL_S = 120   # check every 2 min
+    MAX_POOL_AGE_S = 300            # force reconnect after 5 min
+    AIND_API_URL = "https://api.allenneuraldynamics.org/v2"
+
     def __init__(self, options_factory):
         """options_factory(model) -> ClaudeAgentOptions (or cached)."""
         self._options_factory = options_factory
         self._in_q: asyncio.Queue[_Work | None] = asyncio.Queue(maxsize=1)
         self._worker: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._ready = asyncio.Event()
-        # Wall time of the connect() — lets the caller log warm-vs-cold.
+        self._needs_reconnect = False
+        self._connect_monotonic: float = 0.0
         self._connect_ms: float = 0.0
 
     def start(self) -> None:
-        """Start the pool worker in the background without blocking.
+        """Start the pool worker and MCP watchdog in the background.
 
         Returns immediately — the worker task runs concurrently and sets
         _ready when connect() finishes. Use await_warm() to wait for it.
         """
         if self._worker is None:
             self._worker = asyncio.create_task(self._run(), name="sdk-client-pool")
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._watchdog(), name="mcp-watchdog")
 
     async def await_warm(self, timeout: float) -> bool:
         """Wait up to `timeout` seconds for the pool to become warm.
@@ -124,6 +134,9 @@ class SDKClientPool:
         logger.info("SDK client pool warm: connect took %.0fms", self._connect_ms)
 
     async def shutdown(self):
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
         if self._worker is None:
             return
         await self._in_q.put(None)  # signals worker to disconnect
@@ -159,17 +172,66 @@ class SDKClientPool:
                 raise item.exc
             yield item
 
+    @staticmethod
+    def _ping_aind_api(url: str, timeout: float = 10.0) -> bool:
+        """Synchronous HTTP check — run in executor to avoid blocking."""
+        try:
+            with urlopen(url, timeout=timeout) as resp:
+                return resp.status == 200
+        except (URLError, OSError, TimeoutError):
+            return False
+
+    async def _watchdog(self):
+        """Background task: periodically health-check the AIND API and
+        force a pool reconnect when the connection is stale.
+
+        Every HEALTH_CHECK_INTERVAL_S:
+        1. Ping api.allenneuraldynamics.org — if unreachable, log a
+           warning (reconnecting won't help if the API is down).
+        2. If reachable AND the pool connection is older than
+           MAX_POOL_AGE_S, set _needs_reconnect so _run() picks it up
+           on the next 30s poll cycle.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                await asyncio.sleep(self.HEALTH_CHECK_INTERVAL_S)
+
+                healthy = await loop.run_in_executor(
+                    None, self._ping_aind_api, self.AIND_API_URL
+                )
+
+                if not healthy:
+                    logger.warning("MCP watchdog: AIND API unreachable (%s)", self.AIND_API_URL)
+                    continue
+
+                if not self.is_warm:
+                    logger.info("MCP watchdog: pool not warm, skipping age check")
+                    continue
+
+                age = time.monotonic() - self._connect_monotonic
+                if age > self.MAX_POOL_AGE_S:
+                    logger.info(
+                        "MCP watchdog: pool age %.0fs > %ds and AIND API healthy — requesting reconnect",
+                        age, self.MAX_POOL_AGE_S,
+                    )
+                    self._needs_reconnect = True
+                else:
+                    logger.debug("MCP watchdog: pool age %.0fs OK, AIND API healthy", age)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("MCP watchdog: unexpected error")
+
     async def _run(self):
         """Worker task — owns one ClaudeSDKClient and auto-reconnects on failure.
 
-        Two failure modes handled:
-        1. Noisy failure: _handle() raises (BrokenPipeError, etc.) →
-           _ready cleared → inner loop breaks → reconnect after 5s.
-        2. Silent failure: MCP subprocess dies without exception →
-           Claude marks AIND tools gone → pool appears warm but tools
-           unavailable → we proactively reconnect after IDLE_RECONNECT_S
-           seconds of inactivity (a long idle means no one is using
-           the session, so reconnect to refresh MCP subprocess state).
+        Three reconnect triggers:
+        1. Noisy failure: _handle() raises → _ready cleared → reconnect.
+        2. Idle timeout: no work for POLL_TIMEOUT_S → reconnect.
+        3. Watchdog: _needs_reconnect flag set by background health
+           check → reconnect on next poll cycle.
 
         On each reconnect cycle, stream_events contextvar is re-set on
         the fresh Queue so tool callbacks in the new client context land
@@ -177,7 +239,7 @@ class SDKClientPool:
         """
         RECONNECT_DELAY_S = 5         # pause between reconnect cycles after failure
         CONNECT_RETRY_DELAY_S = 60    # pause before retrying a failed connect()
-        IDLE_RECONNECT_S = 300.0      # proactively reconnect after 5 min idle
+        POLL_TIMEOUT_S = 30.0         # wake every 30s to check watchdog flag
 
         while True:
             opts = self._options_factory(None)
@@ -196,19 +258,24 @@ class SDKClientPool:
                 t0 = time.perf_counter()
                 await client.connect()
                 self._connect_ms = (time.perf_counter() - t0) * 1000
+                self._connect_monotonic = time.monotonic()
+                self._needs_reconnect = False
                 self._ready.set()
                 logger.info("SDK client pool ready (connect=%.0fms)", self._connect_ms)
 
                 while True:
-                    # Wait for work; timeout triggers a proactive reconnect
-                    # so we don't hold a potentially-dead MCP connection forever.
+                    # Poll with short timeout so we can check the watchdog
+                    # reconnect flag regularly (every 30s).
                     try:
                         work = await asyncio.wait_for(
-                            self._in_q.get(), timeout=IDLE_RECONNECT_S
+                            self._in_q.get(), timeout=POLL_TIMEOUT_S
                         )
                     except asyncio.TimeoutError:
-                        reconnect_reason = f"idle>{IDLE_RECONNECT_S:.0f}s"
-                        break  # outer loop reconnects
+                        if self._needs_reconnect:
+                            self._needs_reconnect = False
+                            reconnect_reason = "watchdog"
+                            break
+                        continue  # keep polling
 
                     if work is None:
                         return  # shutdown signal
@@ -216,7 +283,12 @@ class SDKClientPool:
                     await self._handle(client, work)
                     if not self._ready.is_set():
                         reconnect_reason = "handle-failure"
-                        break  # outer loop reconnects
+                        break
+
+                    if self._needs_reconnect:
+                        self._needs_reconnect = False
+                        reconnect_reason = "watchdog"
+                        break
 
             except asyncio.CancelledError:
                 raise

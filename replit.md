@@ -132,7 +132,9 @@ workspace/
   - `connect_failed` flag distinguishes "failed to connect" (60s retry) from "normal reconnect" (5s)
   - Shutdown via `None` sentinel still works; `cancel()` interrupts any sleep cleanly
   - MCP-unavailability detection: `chat()` checks response text for "aind-data-mcp" / "MCP server" + "reconnect" / "not available"; if found, clears `_ready` to force immediate pool reconnect so the next query works
-  - Idle reconnect reduced from 30 min to 5 min as a safety net for silent MCP death
+  - MCP watchdog: background task pings `api.allenneuraldynamics.org/v2` every 2 min; if API is healthy and pool connection is older than 5 min, forces proactive reconnect to refresh MCP subprocess
+  - Pool `_run()` polls every 30s (down from 5 min idle timeout) so it picks up the watchdog's `_needs_reconnect` flag promptly
+  - `start()` launches both the worker task and the watchdog task
 
 - 2026-03-24: MCP cold-start improvements
   - Removed `nwb_tools` import from `data_access_server.py` — boto3 + hdmf_zarr were adding 20-40s of startup latency; those NWB tools are not in the allowed list anyway
